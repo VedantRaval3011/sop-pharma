@@ -945,8 +945,15 @@ export default function SOPTable({
 
   return (
     <div className="flex flex-col w-full bg-gray-50">
-      <div className="overflow-x-hidden w-full">
-        <table className="w-full table-fixed text-left border-collapse">
+      <div
+        className="w-full overflow-auto overscroll-contain"
+        style={{
+          // Keeps layout stable when scrollbars appear/disappear (prevents “jumping”).
+          scrollbarGutter: "stable both-edges",
+          // Hint to the browser that this subtree is independent (reduces scroll jank on big tables).
+          contain: "content",
+        }}>
+        <table className="w-full min-w-max table-fixed text-left border-collapse">
           <thead className="bg-gray-100 border-b border-gray-300">
             <tr>
               <th className={`${thBase} text-center w-10`} title="Serial number">

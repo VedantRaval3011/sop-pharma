@@ -43,7 +43,13 @@ export interface IComplianceReport extends Document {
   analysisStatus: 'pending' | 'in-progress' | 'completed' | 'failed' | 'partial-failure';
   analysisStartedAt: Date;
   analysisCompletedAt?: Date;
-  analysisEngine: 'gemini-1.5-flash' | 'manual' | 'hybrid' | 'gemini-3-pro-preview';
+  analysisEngine:
+    | 'gemini-2.0-flash'
+    | 'gemini-1.5-flash'
+    | 'gemini-1.5-pro'
+    | 'manual'
+    | 'hybrid'
+    | 'gemini-3-pro-preview';
   processingTimeMs: number;
   
   // Error Tracking (Clear failure reasons)
@@ -74,7 +80,13 @@ export interface IComplianceReport extends Document {
   // 4. COMPLIANCE SCORE (Calculated Result - The answer)
   // ═════════════════════════════════════════════════════════════════════
   overallScore: number;  // 0-10 scale (null if analysis failed)
-  complianceStatus: 'Fully Compliant' | 'Partially Compliant' | 'Non-Compliant' | 'Analysis Pending' | 'Analysis Failed';
+  complianceStatus:
+    | 'Fully Compliant'
+    | 'Partially Compliant'
+    | 'Non-Compliant'
+    | 'Not Applicable'
+    | 'Analysis Pending'
+    | 'Analysis Failed';
   compliancePercentage: number;  // 0-100% for easier visualization
   
   // Score Breakdown (Clear calculation)
@@ -241,7 +253,14 @@ const ComplianceReportSchema = new Schema<IComplianceReport>({
   },
   analysisEngine: {
     type: String,
-    enum: ['gemini-1.5-flash', 'manual', 'hybrid', 'gemini-3-pro-preview'],
+    enum: [
+      'gemini-2.0-flash',
+      'gemini-1.5-flash',
+      'gemini-1.5-pro',
+      'manual',
+      'hybrid',
+      'gemini-3-pro-preview',
+    ],
     default: 'gemini-3-pro-preview',
   },
   processingTimeMs: {
@@ -286,7 +305,7 @@ const ComplianceReportSchema = new Schema<IComplianceReport>({
   },
   complianceStatus: {
     type: String,
-    enum: ['Fully Compliant', 'Partially Compliant', 'Non-Compliant', 'Analysis Pending', 'Analysis Failed'],
+    enum: ['Fully Compliant', 'Partially Compliant', 'Non-Compliant', 'Not Applicable', 'Analysis Pending', 'Analysis Failed'],
     default: 'Analysis Pending',
     required: true,
     index: true,
@@ -418,8 +437,7 @@ const ComplianceReportSchema = new Schema<IComplianceReport>({
 ComplianceReportSchema.index({ sopId: 1, analyzedAt: -1 });
 ComplianceReportSchema.index({ department: 1, complianceStatus: 1 });
 ComplianceReportSchema.index({ overallScore: 1 });
-ComplianceReportSchema.index({ analysisStatus: 1 });  // NEW: Track analysis state
-ComplianceReportSchema.index({ complianceStatus: 1 });
+// `complianceStatus` already has `index: true` on the field; avoid duplicate index warnings in dev.
 ComplianceReportSchema.index({ analyzedAt: -1 });
 ComplianceReportSchema.index({ 'dataIntegrity.dataComplete': 1 });  // NEW: Filter complete data
 // Compound index for the sop-guideline-review GET route:
@@ -428,6 +446,13 @@ ComplianceReportSchema.index({ 'dataIntegrity.dataComplete': 1 });  // NEW: Filt
 ComplianceReportSchema.index({ analysisStatus: 1, analysisCompletedAt: -1 });
 ComplianceReportSchema.index({ sopIdentifier: 1, analysisStatus: 1, analysisCompletedAt: -1 });
 
-const ComplianceReport: Model<IComplianceReport> = mongoose.models.ComplianceReport || mongoose.model<IComplianceReport>('ComplianceReport', ComplianceReportSchema);
+// In Next.js dev/hot-reload, an already-compiled model keeps the old schema (incl enums).
+// Recompile in dev so enum changes like "Not Applicable" take effect without restart.
+if (process.env.NODE_ENV !== 'production' && mongoose.models.ComplianceReport) {
+  delete mongoose.models.ComplianceReport;
+}
+
+const ComplianceReport: Model<IComplianceReport> =
+  mongoose.models.ComplianceReport || mongoose.model<IComplianceReport>('ComplianceReport', ComplianceReportSchema);
 
 export default ComplianceReport;

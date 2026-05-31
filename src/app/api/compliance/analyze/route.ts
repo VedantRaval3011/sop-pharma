@@ -6,6 +6,47 @@ import ComplianceReport from '@/models/ComplianceReport';
 import User from '@/models/User';
 import { analyzeSOPCompliance, filterRelevantGuidelines } from '@/lib/complianceEngine';
 
+function normalizeDedupText(value: unknown): string {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[^\w.\- ]+/g, ' ')
+    .trim();
+}
+
+function extractSectionToken(raw: unknown): string {
+  const s = String(raw || '').trim();
+  const match = s.match(/(\d+(?:\.\d+)*)/);
+  return match ? match[1] : normalizeDedupText(s) || 'n/a';
+}
+
+/**
+ * Remove exact duplicate findings by clause key.
+ *
+ * Design: only hard-dedup (guidelineId + clauseNumber) at the display layer.
+ * Semantic/soft dedup is applied at SAVE TIME in the V3 analysis route so that
+ * the stored report already has clean, distinct findings. A display-layer soft
+ * dedup would over-aggressively collapse findings that share common SOP/topic
+ * words but represent genuinely different regulatory requirements.
+ */
+function dedupeFindingsForDisplay(findings: any[]): any[] {
+  if (!Array.isArray(findings) || findings.length === 0) return [];
+
+  const seen = new Set<string>();
+  const out: any[] = [];
+
+  for (const f of findings) {
+    if (!f) continue;
+    // One finding per (guideline document × clause number)
+    const key = `${String(f.guidelineId || '')}|${String(f.clauseNumber || '')}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(f);
+  }
+
+  return out;
+}
+
 /**
  * API Endpoint: Analyze SOP Compliance Against Guidelines
  * 
@@ -277,9 +318,31 @@ export async function GET(request: NextRequest) {
         );
       }
 
+      const rawFindings = Array.isArray((report as any).findings) ? (report as any).findings : [];
+      // Apply dedup so identical/near-identical gaps are not shown twice.
+      const fullFindings = dedupeFindingsForDisplay(rawFindings);
+      const compliantCount    = fullFindings.filter((f: any) => f?.complianceLevel === 'compliant').length;
+      const partialCount      = fullFindings.filter((f: any) => f?.complianceLevel === 'partial').length;
+      const nonCompliantCount = fullFindings.filter((f: any) => f?.complianceLevel === 'non-compliant' || f?.complianceLevel === 'analysis-failed').length;
+      const notApplicableCount = fullFindings.filter((f: any) => f?.complianceLevel === 'not-applicable').length;
+
       return NextResponse.json({
         success: true,
-        report,
+        report: {
+          ...report,
+          findings: fullFindings,
+          compliantCount,
+          partialCount,
+          nonCompliantCount,
+          scoreBreakdown: {
+            ...(report as any).scoreBreakdown,
+            totalChecks: fullFindings.length,
+            compliantCount,
+            partialCount,
+            nonCompliantCount,
+            notApplicableCount,
+          },
+        },
       });
     }
 

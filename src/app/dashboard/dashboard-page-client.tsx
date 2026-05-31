@@ -173,6 +173,7 @@ export default function DashboardPageClient() {
   // Pre-fetched guidelines list (loaded once on mount so wizard opens instantly)
   const [prefetchedGuidelines, setPrefetchedGuidelines] = useState<any[] | null>(null);
 
+
   // Obsolete SOPs filter (shows in main registry table)
   const [filterObsolete, setFilterObsolete] = useState(false);
   const [registrySearchOpen, setRegistrySearchOpen] = useState(false);
@@ -315,7 +316,7 @@ export default function DashboardPageClient() {
   }, []);
 
   // ── Load persisted compliance results on mount (shuttle pre-load) ────────────
-  const COMPLIANCE_CACHE_KEY = 'dashboard_compliance_cache';
+  const COMPLIANCE_CACHE_KEY = 'dashboard_compliance_cache_v2';
   const COMPLIANCE_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
   useEffect(() => {

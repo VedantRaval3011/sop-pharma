@@ -1,11 +1,12 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuthGuard } from '@/hooks/useAuthGuard';
 import FindingCard from './components/FindingCard';
 import { CheckSquare, Square, Sparkles, X, Copy, BookOpen, FileText, Layers, CheckCircle } from 'lucide-react';
 import { cleanSOPName } from '@/lib/sopLibraryHelper';
+import { filterPrimaryRegistryRowsUniqueByFamily } from '@/lib/registryPrimaryRows';
 
 
 /**
@@ -284,9 +285,11 @@ export default function ComplianceEnginePage() {
   // Data State
   const [folders, setFolders] = useState<GuidelineFolder[]>([]);
   const [guidelines, setGuidelines] = useState<Guideline[]>([]);
+  const [guidelineStats, setGuidelineStats] = useState<Record<string, { totalFindings: number; compliantCount: number; partialCount: number; nonCompliantCount: number; sopCount: number }>>({});
   const [sops, setSops] = useState<SOP[]>([]);
   const [departments, setDepartments] = useState<string[]>([]);
   const [reports, setReports] = useState<ComplianceReport[]>([]);
+  const [canonicalSopCount, setCanonicalSopCount] = useState<number | null>(null);
   
   // Loading States
   const [loadingSops, setLoadingSops] = useState(false);
@@ -295,10 +298,41 @@ export default function ComplianceEnginePage() {
   
   // Analysis State
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState('');
   const [analysisComplete, setAnalysisComplete] = useState(false);
   const [currentResult, setCurrentResult] = useState<any>(null);
   const [totalClausesFromAPI, setTotalClausesFromAPI] = useState(0);
+  // Ref so the async loop reads the live pause value without stale closure
+  const pauseRef = useRef(false);
+  const [analysisStats, setAnalysisStats] = useState<{
+    total: number;
+    completed: number;
+    failed: number;
+    skipped: number;
+    currentIndex: number;
+    currentSopName: string;
+    currentSopIdentifier: string;
+  }>({ total: 0, completed: 0, failed: 0, skipped: 0, currentIndex: 0, currentSopName: '', currentSopIdentifier: '' });
+
+  // Per-category SOP lists for clickable chips
+  const [sopLists, setSopLists] = useState<{
+    completed: { identifier: string; name: string; score: number | null; status: string }[];
+    cached:    { identifier: string; name: string; score: number | null; status: string; analyzedAt?: string }[];
+    skipped:   { identifier: string; name: string }[];
+    failed:    { identifier: string; name: string }[];
+  }>({ completed: [], cached: [], skipped: [], failed: [] });
+  const [activeChip, setActiveChip] = useState<'completed' | 'cached' | 'skipped' | 'failed' | null>(null);
+
+  // Whether to skip SOPs that already have a valid compliance report
+  const [skipExisting, setSkipExisting] = useState(true);
+  // Pre-flight check state (populated when user reaches Review step)
+  const [preflightData, setPreflightData] = useState<{
+    checked: boolean;
+    existingCount: number;
+    newCount: number;
+    gujaratiCount: number;
+  }>({ checked: false, existingCount: 0, newCount: 0, gujaratiCount: 0 });
   
   // UI State
   const [selectedReport, setSelectedReport] = useState<ComplianceReport | null>(null);
@@ -577,17 +611,57 @@ export default function ComplianceEnginePage() {
   const fetchSops = async () => {
     setLoadingSops(true);
     try {
-      const sopsResponse = await fetch('/api/compliance/sops?limit=500');
-      const data = await sopsResponse.json();
-      if (data.success) {
-        setSops(Array.isArray(data.sops) ? data.sops : []);
-        setDepartments(Array.isArray(data.departments) ? data.departments : []);
+      // Source SOP inventory from the same dashboard endpoint/counting logic.
+      const dashboardResponse = await fetch('/api/dashboard/sops', { cache: 'no-store' });
+      const dashboardData = await dashboardResponse.json().catch(() => ({}));
+
+      if (dashboardResponse.ok && dashboardData?.success && Array.isArray(dashboardData.data)) {
+        const primaryRows = filterPrimaryRegistryRowsUniqueByFamily(dashboardData.data);
+        const normalizedSops: SOP[] = primaryRows
+          .map((row: any) => ({
+            _id: String(row?._id || row?.sopId || '').trim(),
+            identifier: String(row?.sopNo || row?.identifier || '').trim(),
+            name: cleanSOPName(
+              String(row?.englishName || row?.sopName || row?.name || '').trim(),
+              String(row?.sopNo || row?.identifier || '').trim(),
+            ),
+            department: String(row?.department || 'Unknown').trim() || 'Unknown',
+            version: row?.version != null ? String(row.version) : undefined,
+            location: String(row?.location || '').trim(),
+          }))
+          .filter((s) => s._id && s.identifier);
+
+        const dedupedDepartments = Array.from(
+          new Set(normalizedSops.map((s) => s.department).filter(Boolean)),
+        ).sort();
+
+        setSops(normalizedSops);
+        setDepartments(dedupedDepartments);
+        setCanonicalSopCount(
+          typeof dashboardData?.metadata?.primaryRegistryRowCount === 'number'
+            ? dashboardData.metadata.primaryRegistryRowCount
+            : normalizedSops.length,
+        );
       } else {
-        setSops([]);
-        setDepartments([]);
+        // Fallback: legacy compliance endpoint.
+        const sopsResponse = await fetch('/api/compliance/sops?limit=500');
+        const data = await sopsResponse.json().catch(() => ({}));
+        if (data.success) {
+          const fetchedSops = Array.isArray(data.sops) ? data.sops : [];
+          setSops(fetchedSops);
+          setDepartments(Array.isArray(data.departments) ? data.departments : []);
+          setCanonicalSopCount(fetchedSops.length);
+        } else {
+          setSops([]);
+          setDepartments([]);
+          setCanonicalSopCount(0);
+        }
       }
     } catch (error) {
       console.error('Error fetching SOPs:', error);
+      setSops([]);
+      setDepartments([]);
+      setCanonicalSopCount(0);
     } finally {
       setLoadingSops(false);
     }
@@ -621,6 +695,13 @@ export default function ComplianceEnginePage() {
         setGuidelines([]);
         setTotalClausesFromAPI(0);
       }
+
+      // Fetch compliance point stats per guideline (non-blocking)
+      try {
+        const statsRes = await fetch('/api/compliance/guideline-stats');
+        const statsData = await statsRes.json();
+        if (statsData.success) setGuidelineStats(statsData.stats || {});
+      } catch { /* non-fatal */ }
     } catch (error) {
       console.error('Error fetching guidelines:', error);
     } finally {
@@ -763,6 +844,38 @@ export default function ComplianceEnginePage() {
       alert('Error deleting report');
     }
   };
+  // Pre-flight: check which SOPs already have reports so the Review step can
+  // show an accurate summary before the user clicks Start.
+  const runPreflightCheck = useCallback(async () => {
+    const target = selectedSopId === 'all' ? sops : sops.filter(s => s._id === selectedSopId);
+    if (target.length === 0) return;
+
+    const gujaratiCount = target.filter(clientIsGujarati).length;
+    const nonGuj = target.filter(s => !clientIsGujarati(s));
+
+    try {
+      const res  = await fetch('/api/compliance/check-existing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sopIds: nonGuj.map(s => s._id) }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error);
+
+      const existingCount = nonGuj.filter(s => data.results?.[s._id]?.hasReport).length;
+      const newCount      = nonGuj.length - existingCount;
+
+      setPreflightData({ checked: true, existingCount, newCount, gujaratiCount });
+    } catch {
+      setPreflightData({ checked: false, existingCount: 0, newCount: target.length - gujaratiCount, gujaratiCount });
+    }
+  }, [sops, selectedSopId]);
+
+  // Re-run preflight whenever scope or skipExisting changes on Review step
+  useEffect(() => {
+    if (currentStep === 'review') runPreflightCheck();
+  }, [currentStep, selectedSopId, skipExisting]);
+
   // Run Analysis for all SOPs
   const runFullAnalysis = async () => {
     if (sops.length === 0) {
@@ -775,28 +888,91 @@ export default function ComplianceEnginePage() {
       return;
     }
 
+    // Reset pause state
+    pauseRef.current = false;
+    setIsPaused(false);
     setIsAnalyzing(true);
     setAnalysisComplete(false);
     setCurrentStep('analyze');
-    
+
+    const waitIfPaused = () =>
+      new Promise<void>(resolve => {
+        const check = () => (pauseRef.current ? setTimeout(check, 500) : resolve());
+        check();
+      });
+
     let successCount = 0;
     let failCount = 0;
 
-    const sopsToAnalyze = selectedSopId === 'all' 
-      ? sops 
+    const allCandidates = selectedSopId === 'all'
+      ? sops
       : sops.filter(s => s._id === selectedSopId);
 
-    if (sopsToAnalyze.length === 0) {
+    if (allCandidates.length === 0) {
       alert('No SOP selected for analysis');
       return;
     }
 
+    // ── PRE-FLIGHT: check existing reports ─────────────────────────────
+    setAnalysisProgress('Checking for existing compliance reports…');
+
+    let existingMap: Record<string, { hasReport: boolean; overallScore?: number | null; complianceStatus?: string; analyzedAt?: string }> = {};
+    try {
+      const pfRes  = await fetch('/api/compliance/check-existing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sopIds: allCandidates.map(s => s._id) }),
+      });
+      const pfData = await pfRes.json();
+      if (pfData.success) existingMap = pfData.results || {};
+    } catch { /* non-fatal — fall through and analyze all */ }
+
+    // Partition: cached (skip if !forceRerun), needsAnalysis
+    const cachedSops   = skipExisting ? allCandidates.filter(s => existingMap[s._id]?.hasReport) : [];
+    const sopsToAnalyze = allCandidates.filter(s => !existingMap[s._id]?.hasReport || !skipExisting);
+
+    // Pre-populate the cached list immediately
+    const initialCached = cachedSops.map(s => ({
+      identifier: s.identifier,
+      name: s.name,
+      score: existingMap[s._id]?.overallScore ?? null,
+      status: existingMap[s._id]?.complianceStatus || 'Unknown',
+      analyzedAt: existingMap[s._id]?.analyzedAt,
+    }));
+
+    // Total shown in progress = ALL candidates (cached + to-analyze)
+    const totalForProgress = allCandidates.length;
+    successCount = cachedSops.length; // cached counts as "processed"
+
+    // Initialise progress tracker
+    setAnalysisStats({
+      total: totalForProgress,
+      completed: cachedSops.length,
+      failed: 0,
+      skipped: 0,
+      currentIndex: cachedSops.length,
+      currentSopName: sopsToAnalyze[0]?.name || '',
+      currentSopIdentifier: sopsToAnalyze[0]?.identifier || '',
+    });
+    setSopLists({ completed: [], cached: initialCached, skipped: [], failed: [] });
+    setActiveChip(null);
+
     for (let i = 0; i < sopsToAnalyze.length; i++) {
       const sop = sopsToAnalyze[i];
-      setAnalysisProgress(`Analyzing ${i + 1}/${sopsToAnalyze.length}: ${sop.identifier} - ${sop.name}`);
+      // Global progress index (cached SOPs already accounted for)
+      const globalIdx = cachedSops.length + i;
+
+      await waitIfPaused();
+
+      setAnalysisStats(prev => ({
+        ...prev,
+        currentIndex: globalIdx,
+        currentSopName: sop.name,
+        currentSopIdentifier: sop.identifier,
+      }));
+      setAnalysisProgress(`Analyzing ${globalIdx + 1}/${totalForProgress}: ${sop.identifier} - ${sop.name}`);
 
       try {
-        // Use V3 API (V4 can't handle improperly parsed guidelines)
         const response = await fetch('/api/compliance/analyze-v3', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -804,39 +980,77 @@ export default function ComplianceEnginePage() {
             sopId: sop._id,
             userId: '000000000000000000000001',
             config: {
-              aiModel: 'gemini-3-pro-preview',
+              aiModel: 'gemini-2.0-flash',
               maxClausesToAnalyze: 200,
             },
           }),
         });
 
-
         const data = await response.json();
-        if (data.success) {
+        if (data.success && data.skipped) {
+          // Gujarati SOP — counted as processed, not failed
+          successCount++;
+          setAnalysisStats(prev => ({ ...prev, completed: successCount, skipped: prev.skipped + 1 }));
+          setSopLists(prev => ({
+            ...prev,
+            skipped: [...prev.skipped, { identifier: sop.identifier, name: sop.name }],
+          }));
+          console.log(`⏭️ ${sop.identifier}: Skipped — ${data.userMessage}`);
+        } else if (data.success) {
           successCount++;
           setCurrentResult(data);
+          setAnalysisStats(prev => ({ ...prev, completed: successCount }));
+          setSopLists(prev => ({
+            ...prev,
+            completed: [...prev.completed, {
+              identifier: sop.identifier,
+              name: sop.name,
+              score: typeof data.overallScore === 'number' ? data.overallScore : null,
+              status: data.complianceStatus || 'Unknown',
+            }],
+          }));
           console.log(`✅ ${sop.identifier}: Score ${data.overallScore}/10 - ${data.complianceStatus}`);
         } else {
           failCount++;
+          setAnalysisStats(prev => ({ ...prev, failed: failCount }));
+          setSopLists(prev => ({
+            ...prev,
+            failed: [...prev.failed, { identifier: sop.identifier, name: sop.name }],
+          }));
           console.warn(`⚠️ ${sop.identifier}: ${data.error || data.userMessage}`);
-          // If gatekeeping failed, still show the reason
-          if (data.gatekeeping) {
-            console.log('   Gatekeeping:', data.gatekeeping);
-          }
         }
       } catch (error) {
         console.error('Analysis error for', sop.identifier, error);
         failCount++;
+        setAnalysisStats(prev => ({ ...prev, failed: failCount }));
+        setSopLists(prev => ({
+          ...prev,
+          failed: [...prev.failed, { identifier: sop.identifier, name: sop.name }],
+        }));
       }
 
-      // Small delay to prevent rate limiting
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
-    setAnalysisProgress(`✅ Analysis Complete: ${successCount} passed, ${failCount} failed`);
+    // Final state — mark all done
+    setAnalysisStats(prev => ({
+      ...prev,
+      completed: successCount,
+      failed: failCount,
+      currentIndex: totalForProgress,
+    }));
+    setAnalysisProgress(
+      `✅ Analysis Complete: ${successCount - cachedSops.length} newly analyzed · ${cachedSops.length} cached · ${failCount} failed`
+    );
     setIsAnalyzing(false);
+    setIsPaused(false);
+    pauseRef.current = false;
     setAnalysisComplete(true);
     fetchReports();
+    fetch('/api/compliance/guideline-stats')
+      .then(r => r.json())
+      .then(d => { if (d.success) setGuidelineStats(d.stats || {}); })
+      .catch(() => {});
   };
 
   // Initial load
@@ -848,6 +1062,15 @@ export default function ComplianceEnginePage() {
 
   // Calculate total clauses (use API provided count if in summary mode)
   const totalClauses = totalClausesFromAPI || (guidelines || []).reduce((sum, g) => sum + (g.clauseCount ?? (g.clauses?.length || 0)), 0);
+
+  // Client-side Gujarati detection (mirrors server-side isGujaratiSOP)
+  const clientIsGujarati = (sop: SOP): boolean => {
+    const combined = [sop.identifier || '', sop.name || '', (sop as any).folderPath || ''].join(' ');
+    if (/[઀-૿]{4,}/.test(combined)) return true;
+    if (/(^|[\/\\\s_\-\.])guj([\/\\\s_\-\.]|$)/i.test(combined)) return true;
+    if (/gujarati/i.test(combined)) return true;
+    return false;
+  };
 
   const getStepStyle = (stepId: string) => {
     const isActive = currentStep === stepId;
@@ -863,9 +1086,14 @@ export default function ComplianceEnginePage() {
       case 'Fully Compliant': return 'bg-emerald-100 text-emerald-700 border-emerald-200';
       case 'Partially Compliant': return 'bg-amber-100 text-amber-700 border-amber-200';
       case 'Non-Compliant': return 'bg-rose-100 text-rose-700 border-rose-200';
+      case 'Not Applicable': return 'bg-slate-100 text-slate-700 border-slate-200';
+      case 'Analysis Pending': return 'bg-blue-100 text-blue-700 border-blue-200';
+      case 'Analysis Failed': return 'bg-orange-100 text-orange-700 border-orange-200';
       default: return 'bg-gray-100 text-gray-600 border-gray-200';
     }
   };
+
+  const sopCountDisplay = canonicalSopCount ?? sops.length;
 
   return (
     <div className="min-h-screen bg-[#f8f9fa] font-sans">
@@ -895,7 +1123,7 @@ export default function ComplianceEnginePage() {
       <div className="max-w-7xl mx-auto px-6 py-8">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-10">
           {[
-            { id: 'fetch-sops', label: '1. SOPs', icon: '📄', count: sops?.length || 0 },
+            { id: 'fetch-sops', label: '1. SOPs', icon: '📄', count: sopCountDisplay },
             { id: 'fetch-guidelines', label: '2. Guidelines', icon: '📚', count: guidelines?.length || 0 },
             { id: 'review', label: '3. Review', icon: '👁️', count: null },
             { id: 'analyze', label: '4. Analyze', icon: '🤖', count: null },
@@ -927,7 +1155,7 @@ export default function ComplianceEnginePage() {
                 <div>
                   <h2 className="text-2xl font-bold text-gray-800">SOP Repository</h2>
                   <p className="text-gray-500 mt-1">
-                    {sops?.length || 0} SOPs across {departments?.length || 0} departments available for analysis.
+                    {sopCountDisplay} SOPs across {departments?.length || 0} departments available for analysis.
                   </p>
                 </div>
                 <button
@@ -953,7 +1181,7 @@ export default function ComplianceEnginePage() {
                     onChange={(e) => setFilterDepartment(e.target.value)}
                     className="pl-4 pr-10 py-2.5 bg-white border border-gray-200 rounded-lg text-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500/20 text-sm appearance-none cursor-pointer hover:border-purple-300 transition-all font-medium min-w-[240px]"
                   >
-                    <option value="all">All Departments ({sops?.length || 0})</option>
+                    <option value="all">All Departments ({sopCountDisplay})</option>
                     {(departments || []).map(dept => (
                       <option key={dept} value={dept}>
                         {dept} ({(sops || []).filter(s => s.department === dept).length})
@@ -1117,19 +1345,45 @@ export default function ComplianceEnginePage() {
                         onClick={() => handleToggleGuideline(guideline)}
                         className="w-full p-5 flex items-center justify-between text-left hover:bg-purple-50/50 transition-colors"
                       >
-                        <div className="flex-1 pr-12">
-                            <div className="flex items-center gap-2 mb-1.5">
-                                <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-[10px] font-bold uppercase tracking-wider border border-purple-200">
-                                   {guideline.folderName}
-                                </span>
-                                <span className="text-gray-400 text-xs px-2 border-l border-gray-200">{guideline.guidelineType}</span>
-                            </div>
-                            <h3 className="text-gray-800 font-semibold text-lg">{guideline.name}</h3>
+                        <div className="flex-1 pr-4 min-w-0">
+                          <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                            <span className="px-2 py-0.5 bg-purple-100 text-purple-700 rounded text-[10px] font-bold uppercase tracking-wider border border-purple-200">
+                              {guideline.folderName}
+                            </span>
+                            <span className="text-gray-400 text-xs px-2 border-l border-gray-200">{guideline.guidelineType}</span>
+                          </div>
+                          <h3 className="text-gray-800 font-semibold text-base leading-tight">{guideline.name}</h3>
                         </div>
-                        <div className="flex items-center gap-4">
-                          <span className="px-3 py-1 bg-white text-gray-600 rounded-full text-xs font-medium border border-gray-200">
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {/* Clause count */}
+                          <span className="px-2.5 py-1 bg-white text-gray-500 rounded-lg text-xs font-medium border border-gray-200">
                             {guideline.clauseCount ?? (guideline.clauses?.length || 0)} clauses
                           </span>
+
+                          {/* Compliance points badge — shown once any reports exist */}
+                          {(() => {
+                            const stat = guidelineStats[guideline.name];
+                            if (!stat || stat.totalFindings === 0) return null;
+                            const hasFailed = stat.nonCompliantCount > 0;
+                            const allGood   = stat.compliantCount === stat.totalFindings;
+                            return (
+                              <div className="flex items-center gap-1">
+                                <span className={`px-2.5 py-1 rounded-lg text-xs font-bold border ${
+                                  allGood  ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                                  hasFailed ? 'bg-rose-50 text-rose-700 border-rose-200' :
+                                             'bg-amber-50 text-amber-700 border-amber-200'
+                                }`}>
+                                  {stat.totalFindings} points
+                                </span>
+                                {stat.sopCount > 0 && (
+                                  <span className="px-2 py-1 bg-purple-50 text-purple-600 rounded-lg text-[10px] font-bold border border-purple-200">
+                                    {stat.sopCount} SOP{stat.sopCount !== 1 ? 's' : ''}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })()}
+
                           <span className={`text-gray-400 transition-transform duration-300 ${expandedGuideline === guideline._id ? 'rotate-180' : ''}`}>
                             ▼
                           </span>
@@ -1139,6 +1393,36 @@ export default function ComplianceEnginePage() {
                       {/* Expanded Clause List */}
                       {expandedGuideline === guideline._id && (
                         <div className="px-5 pb-5 pt-2 bg-white border-t border-gray-100">
+                          {/* Compliance points summary bar */}
+                          {(() => {
+                            const stat = guidelineStats[guideline.name];
+                            if (!stat || stat.totalFindings === 0) return null;
+                            return (
+                              <div className="mb-3 p-3 bg-gray-50 rounded-xl border border-gray-100 flex flex-wrap items-center gap-3">
+                                <span className="text-[10px] font-black text-gray-400 uppercase tracking-wider">Compliance points:</span>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="flex items-center gap-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded">
+                                    ✓ {stat.compliantCount} compliant
+                                  </span>
+                                  <span className="flex items-center gap-1 text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded">
+                                    ~ {stat.partialCount} partial
+                                  </span>
+                                  <span className="flex items-center gap-1 text-[10px] font-bold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded">
+                                    ✗ {stat.nonCompliantCount} gaps
+                                  </span>
+                                  <span className="text-[10px] text-gray-400 font-semibold ml-1">
+                                    across {stat.sopCount} SOP{stat.sopCount !== 1 ? 's' : ''}
+                                  </span>
+                                </div>
+                                {/* Mini progress bar */}
+                                <div className="flex-1 min-w-[80px] h-1.5 bg-gray-200 rounded-full overflow-hidden flex">
+                                  <div className="bg-emerald-500 h-full" style={{ width: `${(stat.compliantCount / stat.totalFindings) * 100}%` }} />
+                                  <div className="bg-amber-400 h-full" style={{ width: `${(stat.partialCount / stat.totalFindings) * 100}%` }} />
+                                  <div className="bg-rose-500 h-full" style={{ width: `${(stat.nonCompliantCount / stat.totalFindings) * 100}%` }} />
+                                </div>
+                              </div>
+                            );
+                          })()}
                           <div className="space-y-2.5 max-h-80 overflow-y-auto pr-2 custom-scrollbar mt-2">
                             {(!guideline.clauses || loadingGuidelineId === guideline._id) ? (
                               <div className="py-8 text-center bg-gray-50 rounded-lg border border-gray-100 shadow-sm">
@@ -1255,7 +1539,7 @@ export default function ComplianceEnginePage() {
               <h2 className="text-2xl font-bold text-gray-800 mb-6">Review Configuration</h2>
 
               {/* Scope Selection */}
-              <div className="bg-gray-50 rounded-xl border border-gray-100 p-6 mb-8">
+              <div className="bg-gray-50 rounded-xl border border-gray-100 p-6 mb-4">
                 <label className="block text-sm font-medium text-gray-600 mb-3">Select Analysis Scope</label>
                 <div className="relative">
                   <select
@@ -1263,7 +1547,7 @@ export default function ComplianceEnginePage() {
                     onChange={(e) => setSelectedSopId(e.target.value)}
                     className="w-full pl-4 pr-10 py-3 bg-white border border-gray-200 rounded-xl text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500/30 appearance-none cursor-pointer"
                   >
-                    <option value="all">Analyze All Available SOPs ({sops.length})</option>
+                    <option value="all">Analyze All Available SOPs ({sopCountDisplay})</option>
                     <optgroup label="Individual SOPs">
                       {sops.map(sop => (
                         <option key={sop._id} value={sop._id}>
@@ -1272,9 +1556,54 @@ export default function ComplianceEnginePage() {
                       ))}
                     </optgroup>
                   </select>
-                  <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
-                    ▼
+                  <div className="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">▼</div>
+                </div>
+              </div>
+
+              {/* Skip-existing toggle */}
+              <div className={`rounded-xl border p-5 mb-8 transition-all ${skipExisting ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex-1">
+                    <p className={`text-sm font-bold mb-0.5 ${skipExisting ? 'text-blue-800' : 'text-amber-800'}`}>
+                      {skipExisting ? '✅ Smart Mode — skip SOPs with existing results' : '⚠️ Force Mode — re-analyze all SOPs'}
+                    </p>
+                    <p className={`text-xs leading-relaxed ${skipExisting ? 'text-blue-600' : 'text-amber-600'}`}>
+                      {skipExisting
+                        ? 'SOPs that already have a compliance report will be skipped. Only new or unanalyzed SOPs will be processed.'
+                        : 'All SOPs will be re-analyzed, overwriting any existing compliance results. This may take significantly longer.'}
+                    </p>
+
+                    {/* Pre-flight summary */}
+                    {preflightData.checked && (
+                      <div className="mt-3 flex flex-wrap gap-3">
+                        <span className="flex items-center gap-1.5 text-[10px] font-black text-emerald-700 bg-white border border-emerald-200 px-2.5 py-1 rounded-lg">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                          {skipExisting ? preflightData.newCount : preflightData.newCount + preflightData.existingCount} to analyze
+                        </span>
+                        {skipExisting && preflightData.existingCount > 0 && (
+                          <span className="flex items-center gap-1.5 text-[10px] font-black text-blue-700 bg-white border border-blue-200 px-2.5 py-1 rounded-lg">
+                            <span className="w-2 h-2 rounded-full bg-blue-500" />
+                            {preflightData.existingCount} cached (will be skipped)
+                          </span>
+                        )}
+                        {preflightData.gujaratiCount > 0 && (
+                          <span className="flex items-center gap-1.5 text-[10px] font-black text-slate-600 bg-white border border-slate-200 px-2.5 py-1 rounded-lg">
+                            <span className="w-2 h-2 rounded-full bg-slate-400" />
+                            {preflightData.gujaratiCount} Gujarati (N/A)
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
+
+                  {/* Toggle switch */}
+                  <button
+                    onClick={() => setSkipExisting(v => !v)}
+                    className={`relative flex-shrink-0 w-12 h-6 rounded-full transition-colors focus:outline-none ${skipExisting ? 'bg-blue-500' : 'bg-amber-400'}`}
+                    title={skipExisting ? 'Switch to Force Re-run mode' : 'Switch to Smart mode'}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${skipExisting ? 'translate-x-6' : 'translate-x-0'}`} />
+                  </button>
                 </div>
               </div>
 
@@ -1283,7 +1612,7 @@ export default function ComplianceEnginePage() {
                 <div className="p-6 bg-purple-50 rounded-2xl border border-purple-200">
                   <p className="text-purple-600 font-medium text-xs uppercase tracking-wider mb-2">Target SOPs</p>
                   <p className="text-4xl font-bold text-gray-800">
-                    {selectedSopId === 'all' ? sops.length : 1}
+                    {selectedSopId === 'all' ? sopCountDisplay : 1}
                   </p>
                   <p className="text-gray-500 text-sm mt-1">
                     {selectedSopId === 'all' ? `across ${departments.length} departments` : 'Selected SOP'}
@@ -1326,7 +1655,7 @@ export default function ComplianceEnginePage() {
                  <div>
                     <p className="font-semibold text-sm">Estimated Duration</p>
                     <p className="text-xs text-blue-600">
-                      ~{Math.ceil((selectedSopId === 'all' ? sops.length : 1) * 0.5)} minutes ({(selectedSopId === 'all' ? sops.length : 1)} SOPs × 30s)
+                      ~{Math.ceil((selectedSopId === 'all' ? sopCountDisplay : 1) * 0.5)} minutes ({(selectedSopId === 'all' ? sopCountDisplay : 1)} SOPs × 30s)
                     </p>
                  </div>
               </div>
@@ -1351,59 +1680,478 @@ export default function ComplianceEnginePage() {
         )}
 
         {/* Step 4: Analysis in Progress */}
-        {currentStep === 'analyze' && (
-          <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-12 text-center">
-              <h2 className="text-2xl font-bold text-gray-800 mb-8">
-                {isAnalyzing ? 'Processing Compliance Checks...' : 'Analysis Complete'}
-              </h2>
+        {currentStep === 'analyze' && (() => {
+          const { total, completed, failed, skipped, currentIndex, currentSopName, currentSopIdentifier } = analysisStats;
+          const remaining  = Math.max(0, total - completed - failed - (isAnalyzing ? 1 : 0));
+          const pctDone    = total > 0 ? Math.round(((completed + failed) / total) * 100) : 0;
+          const estMinLeft = isAnalyzing ? Math.ceil(remaining * 0.5) : 0;
 
-              <div className="max-w-xl mx-auto">
-                {isAnalyzing && (
-                  <div className="mb-8">
-                    <div className="w-20 h-20 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin mx-auto mb-6"></div>
-                    <p className="text-gray-500 animate-pulse">{analysisProgress}</p>
+          return (
+            <div className="space-y-5 animate-in fade-in slide-in-from-bottom-4 duration-500">
+
+              {/* ── Header card ─────────────────────────────────────────── */}
+              <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-6">
+                <div className="flex items-center justify-between mb-6">
+                  <div>
+                    <h2 className="text-xl font-bold text-gray-800">
+                      {!isAnalyzing   ? 'Analysis Complete' :
+                       isPaused       ? 'Analysis Paused' :
+                                        'Processing Compliance Checks…'}
+                    </h2>
+                    {isAnalyzing && total > 0 && (
+                      <p className={`text-sm mt-0.5 ${isPaused ? 'text-amber-500 font-semibold' : 'text-gray-400'}`}>
+                        {isPaused
+                          ? 'Click Resume to continue'
+                          : estMinLeft > 0 ? `~${estMinLeft} min remaining` : 'Finishing up…'}
+                      </p>
+                    )}
                   </div>
-                )}
-
-                {/* Current Result Preview */}
-                {currentResult && (
-                  <div className="p-6 bg-gray-50 rounded-xl border border-gray-200 text-left shadow-sm transition-all animate-in zoom-in-95 duration-300">
-                    <div className="flex items-center justify-between mb-4">
-                        <span className="text-xs font-bold text-gray-400 uppercase tracking-wider">Latest Result</span>
-                        {currentResult.complianceStatus && (
-                            <span className={`px-2 py-1 rounded-md text-xs font-bold ${getStatusColor(currentResult.complianceStatus)}`}>
-                            {currentResult.complianceStatus}
-                            </span>
+                  <div className="flex items-center gap-3">
+                    {/* Pause / Resume button */}
+                    {isAnalyzing && (
+                      <button
+                        onClick={() => {
+                          const next = !pauseRef.current;
+                          pauseRef.current = next;
+                          setIsPaused(next);
+                        }}
+                        className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold border transition-all shadow-sm ${
+                          isPaused
+                            ? 'bg-purple-600 border-purple-600 text-white hover:bg-purple-700 shadow-purple-200'
+                            : 'bg-amber-50 border-amber-300 text-amber-700 hover:bg-amber-100'
+                        }`}
+                      >
+                        {isPaused ? (
+                          <>
+                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
+                            </svg>
+                            Resume
+                          </>
+                        ) : (
+                          <>
+                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                              <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                            </svg>
+                            Pause
+                          </>
                         )}
-                    </div>
-                    
-                    <h3 className="text-lg font-bold text-gray-800 mb-1">{currentResult.sopName}</h3>
-                    <p className="text-gray-500 text-sm mb-4 font-mono">{currentResult.sopIdentifier}</p>
+                      </button>
+                    )}
 
-                    <div className="flex items-center gap-2">
-                        <span className="text-gray-600 text-sm font-medium">Score:</span>
-                        <span className={`text-2xl font-bold ${getScoreColor(currentResult.overallScore)}`}>
-                          {currentResult.overallScore}/10
-                        </span>
+                    {/* Percentage badge */}
+                    <div className={`w-14 h-14 rounded-2xl flex flex-col items-center justify-center border-2 ${
+                      analysisComplete ? 'bg-emerald-50 border-emerald-300' :
+                      isPaused         ? 'bg-amber-50 border-amber-300' :
+                                         'bg-purple-50 border-purple-300'
+                    }`}>
+                      <span className={`text-lg font-black leading-none ${
+                        analysisComplete ? 'text-emerald-600' :
+                        isPaused         ? 'text-amber-600' :
+                                           'text-purple-600'
+                      }`}>
+                        {pctDone}%
+                      </span>
+                      <span className="text-[9px] font-bold text-gray-400 uppercase tracking-wider">done</span>
                     </div>
+                  </div>
+                </div>
+
+                {/* ── Segmented progress bar ─────────────────────────── */}
+                {total > 0 && (
+                  <div className="space-y-2 mb-6">
+                    <div className="relative h-5 w-full bg-gray-100 rounded-full overflow-hidden border border-gray-200">
+                      {/* Completed (green) */}
+                      <div
+                        className="absolute left-0 top-0 h-full bg-emerald-500 transition-all duration-500 rounded-l-full"
+                        style={{ width: `${(completed / total) * 100}%` }}
+                      />
+                      {/* Failed (red) */}
+                      <div
+                        className="absolute top-0 h-full bg-rose-400 transition-all duration-500"
+                        style={{
+                          left: `${(completed / total) * 100}%`,
+                          width: `${(failed / total) * 100}%`,
+                        }}
+                      />
+                      {/* Current / in-progress (animated purple) */}
+                      {isAnalyzing && (
+                        <div
+                          className="absolute top-0 h-full bg-purple-500 transition-all duration-500"
+                          style={{
+                            left: `${((completed + failed) / total) * 100}%`,
+                            width: `${(1 / total) * 100}%`,
+                          }}
+                        >
+                          {/* shimmer */}
+                          <div className="h-full w-full bg-gradient-to-r from-transparent via-white/30 to-transparent animate-pulse" />
+                        </div>
+                      )}
+                      {/* Remaining (already gray from parent) */}
+
+                      {/* Percentage label centred */}
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <span className="text-[10px] font-black text-white drop-shadow">
+                          {completed + failed} / {total}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* ── Five clickable stat chips ─────────────────── */}
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+                      {/* Completed */}
+                      <button
+                        onClick={() => setActiveChip(activeChip === 'completed' ? null : 'completed')}
+                        disabled={sopLists.completed.length === 0}
+                        className={`flex items-center gap-2 p-3 rounded-xl border text-left transition-all ${
+                          activeChip === 'completed'
+                            ? 'bg-emerald-100 border-emerald-400 ring-2 ring-emerald-200'
+                            : sopLists.completed.length > 0
+                              ? 'bg-emerald-50 border-emerald-200 hover:border-emerald-400 hover:bg-emerald-100 cursor-pointer'
+                              : 'bg-emerald-50 border-emerald-200 opacity-60 cursor-default'
+                        }`}
+                      >
+                        <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[10px] font-black text-emerald-600 uppercase tracking-wider">Completed</p>
+                          <p className="text-xl font-black text-emerald-700 leading-none">{completed - skipped}</p>
+                        </div>
+                        {sopLists.completed.length > 0 && (
+                          <svg className={`w-3 h-3 text-emerald-500 flex-shrink-0 transition-transform ${activeChip === 'completed' ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                        )}
+                      </button>
+
+                      {/* Cached (existing reports) */}
+                      <button
+                        onClick={() => setActiveChip(activeChip === 'cached' ? null : 'cached')}
+                        disabled={sopLists.cached.length === 0}
+                        className={`flex items-center gap-2 p-3 rounded-xl border text-left transition-all ${
+                          activeChip === 'cached'
+                            ? 'bg-blue-100 border-blue-400 ring-2 ring-blue-200'
+                            : sopLists.cached.length > 0
+                              ? 'bg-blue-50 border-blue-200 hover:border-blue-400 hover:bg-blue-100 cursor-pointer'
+                              : 'bg-blue-50 border-blue-200 opacity-60 cursor-default'
+                        }`}
+                      >
+                        <div className="w-2.5 h-2.5 rounded-full bg-blue-500 flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[10px] font-black text-blue-600 uppercase tracking-wider">Cached</p>
+                          <p className="text-xl font-black text-blue-700 leading-none">{sopLists.cached.length}</p>
+                        </div>
+                        {sopLists.cached.length > 0 && (
+                          <svg className={`w-3 h-3 text-blue-400 flex-shrink-0 transition-transform ${activeChip === 'cached' ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                        )}
+                      </button>
+
+                      {/* Remaining — not clickable (no list yet) */}
+                      <div className="flex items-center gap-2 p-3 bg-purple-50 border border-purple-200 rounded-xl">
+                        <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${isAnalyzing ? 'bg-purple-500 animate-pulse' : 'bg-gray-300'}`} />
+                        <div>
+                          <p className="text-[10px] font-black text-purple-600 uppercase tracking-wider">Remaining</p>
+                          <p className="text-xl font-black text-purple-700 leading-none">{remaining + (isAnalyzing ? 1 : 0)}</p>
+                        </div>
+                      </div>
+
+                      {/* Skipped (Gujarati) */}
+                      <button
+                        onClick={() => setActiveChip(activeChip === 'skipped' ? null : 'skipped')}
+                        disabled={sopLists.skipped.length === 0}
+                        className={`flex items-center gap-2 p-3 rounded-xl border text-left transition-all ${
+                          activeChip === 'skipped'
+                            ? 'bg-slate-100 border-slate-400 ring-2 ring-slate-200'
+                            : sopLists.skipped.length > 0
+                              ? 'bg-slate-50 border-slate-200 hover:border-slate-400 hover:bg-slate-100 cursor-pointer'
+                              : 'bg-slate-50 border-slate-200 opacity-60 cursor-default'
+                        }`}
+                      >
+                        <div className="w-2.5 h-2.5 rounded-full bg-slate-400 flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[10px] font-black text-slate-500 uppercase tracking-wider">Skipped (GUJ)</p>
+                          <p className="text-xl font-black text-slate-600 leading-none">{skipped}</p>
+                        </div>
+                        {sopLists.skipped.length > 0 && (
+                          <svg className={`w-3 h-3 text-slate-400 flex-shrink-0 transition-transform ${activeChip === 'skipped' ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                        )}
+                      </button>
+
+                      {/* Failed */}
+                      <button
+                        onClick={() => setActiveChip(activeChip === 'failed' ? null : 'failed')}
+                        disabled={sopLists.failed.length === 0}
+                        className={`flex items-center gap-2 p-3 rounded-xl border text-left transition-all ${
+                          activeChip === 'failed'
+                            ? 'bg-rose-100 border-rose-400 ring-2 ring-rose-200'
+                            : sopLists.failed.length > 0
+                              ? 'bg-rose-50 border-rose-200 hover:border-rose-400 hover:bg-rose-100 cursor-pointer'
+                              : 'bg-rose-50 border-rose-200 opacity-60 cursor-default'
+                        }`}
+                      >
+                        <div className="w-2.5 h-2.5 rounded-full bg-rose-400 flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-[10px] font-black text-rose-600 uppercase tracking-wider">Failed</p>
+                          <p className="text-xl font-black text-rose-600 leading-none">{failed}</p>
+                        </div>
+                        {sopLists.failed.length > 0 && (
+                          <svg className={`w-3 h-3 text-rose-400 flex-shrink-0 transition-transform ${activeChip === 'failed' ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                        )}
+                      </button>
+                    </div>
+
+                    {/* ── Dropdown panel ────────────────────────────── */}
+                    {activeChip && (
+                      <div className="mt-2 rounded-xl border bg-white shadow-md overflow-hidden animate-in slide-in-from-top-1 duration-150">
+                        {/* Panel header */}
+                        <div className={`px-4 py-2.5 border-b flex items-center justify-between ${
+                          activeChip === 'completed' ? 'bg-emerald-50 border-emerald-100' :
+                          activeChip === 'cached'    ? 'bg-blue-50 border-blue-100' :
+                          activeChip === 'skipped'   ? 'bg-slate-50 border-slate-100' :
+                                                       'bg-rose-50 border-rose-100'
+                        }`}>
+                          <span className={`text-[10px] font-black uppercase tracking-widest ${
+                            activeChip === 'completed' ? 'text-emerald-600' :
+                            activeChip === 'cached'    ? 'text-blue-600' :
+                            activeChip === 'skipped'   ? 'text-slate-500' :
+                                                         'text-rose-600'
+                          }`}>
+                            {activeChip === 'completed' ? `${sopLists.completed.length} Newly Analyzed` :
+                             activeChip === 'cached'    ? `${sopLists.cached.length} Existing Results Used` :
+                             activeChip === 'skipped'   ? `${sopLists.skipped.length} Gujarati SOPs Skipped` :
+                                                          `${sopLists.failed.length} Failed SOPs`}
+                          </span>
+                          <button onClick={() => setActiveChip(null)} className="text-gray-400 hover:text-gray-600 transition-colors">
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {/* SOP list */}
+                        <div className="max-h-56 overflow-y-auto divide-y divide-gray-50">
+                          {activeChip === 'completed' && sopLists.completed.map((s, i) => (
+                            <div key={i} className="flex items-center justify-between px-4 py-2.5 hover:bg-gray-50 transition-colors">
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-gray-700 truncate">{s.name}</p>
+                                <p className="text-[10px] text-gray-400 font-mono">{s.identifier}</p>
+                              </div>
+                              <div className="flex items-center gap-2 flex-shrink-0 ml-3">
+                                {s.score !== null && (
+                                  <span className={`text-sm font-black ${s.score >= 7 ? 'text-emerald-600' : s.score >= 4 ? 'text-amber-600' : 'text-rose-600'}`}>
+                                    {s.score}/10
+                                  </span>
+                                )}
+                                <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${getStatusColor(s.status)}`}>
+                                  {s.status}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+
+                          {activeChip === 'cached' && sopLists.cached.map((s, i) => (
+                            <div key={i} className="flex items-center justify-between px-4 py-2.5 hover:bg-gray-50 transition-colors">
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-gray-700 truncate">{s.name}</p>
+                                <div className="flex items-center gap-2 mt-0.5">
+                                  <p className="text-[10px] text-gray-400 font-mono">{s.identifier}</p>
+                                  {s.analyzedAt && (
+                                    <p className="text-[9px] text-gray-300 font-medium">
+                                      · {new Date(s.analyzedAt).toLocaleDateString()} {new Date(s.analyzedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 flex-shrink-0 ml-3">
+                                {s.score !== null && s.score !== undefined && (
+                                  <span className={`text-sm font-black ${s.score >= 7 ? 'text-emerald-600' : s.score >= 4 ? 'text-amber-600' : 'text-rose-600'}`}>
+                                    {s.score}/10
+                                  </span>
+                                )}
+                                <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${getStatusColor(s.status)}`}>
+                                  {s.status}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+
+                          {activeChip === 'skipped' && sopLists.skipped.map((s, i) => (
+                            <div key={i} className="flex items-center justify-between px-4 py-2.5 hover:bg-gray-50 transition-colors">
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-gray-700 truncate">{s.name}</p>
+                                <p className="text-[10px] text-gray-400 font-mono">{s.identifier}</p>
+                              </div>
+                              <span className="px-2 py-0.5 rounded text-[9px] font-bold border bg-slate-100 text-slate-600 border-slate-200 flex-shrink-0 ml-3">
+                                GUJ – N/A
+                              </span>
+                            </div>
+                          ))}
+
+                          {activeChip === 'failed' && sopLists.failed.map((s, i) => (
+                            <div key={i} className="flex items-center justify-between px-4 py-2.5 hover:bg-gray-50 transition-colors">
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold text-gray-700 truncate">{s.name}</p>
+                                <p className="text-[10px] text-gray-400 font-mono">{s.identifier}</p>
+                              </div>
+                              <span className="px-2 py-0.5 rounded text-[9px] font-bold border bg-rose-50 text-rose-600 border-rose-200 flex-shrink-0 ml-3">
+                                Error
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
-                {analysisComplete && (
-                  <div className="mt-8">
+                {/* ── Current SOP being processed / paused ───────────── */}
+                {isAnalyzing && currentSopIdentifier && (
+                  <div className={`flex items-center gap-3 p-4 rounded-xl border transition-colors ${
+                    isPaused
+                      ? 'bg-amber-50 border-amber-200'
+                      : 'bg-purple-50 border-purple-200'
+                  }`}>
+                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                      isPaused ? 'bg-amber-400' : 'bg-purple-600'
+                    }`}>
+                      {isPaused ? (
+                        <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                        </svg>
+                      ) : (
+                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className={`text-[10px] font-black uppercase tracking-wider mb-0.5 ${
+                        isPaused ? 'text-amber-600' : 'text-purple-500'
+                      }`}>
+                        {isPaused
+                          ? `⏸ Paused at SOP ${currentIndex + 1} of ${total}`
+                          : `Analyzing SOP ${currentIndex + 1} of ${total}`}
+                      </p>
+                      <p className="text-sm font-bold text-gray-800 truncate">{currentSopName}</p>
+                      <p className={`text-xs font-mono ${isPaused ? 'text-amber-500' : 'text-purple-500'}`}>
+                        {currentSopIdentifier}
+                      </p>
+                    </div>
+                    {isPaused && (
+                      <span className="px-2.5 py-1 bg-amber-100 border border-amber-300 text-amber-700 text-[10px] font-black rounded-lg uppercase tracking-wider flex-shrink-0">
+                        Paused
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* ── SOP dot-grid ─────────────────────────────────────── */}
+              {total > 0 && total <= 100 && (
+                <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+                  <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-3">SOP Progress Map</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {Array.from({ length: total }).map((_, idx) => {
+                      const cachedCount  = sopLists.cached.length;
+                      const isCached     = idx < cachedCount;
+                      const isNewDone    = idx >= cachedCount && idx < cachedCount + (completed - skipped - cachedCount);
+                      const isSkipped    = idx >= cachedCount + (completed - skipped - cachedCount) && idx < completed;
+                      const isFailed     = idx >= completed && idx < completed + failed;
+                      const isCurrent    = isAnalyzing && idx === completed + failed;
+                      return (
+                        <div
+                          key={idx}
+                          title={
+                            isCached   ? 'Existing result used' :
+                            isNewDone  ? 'Newly analyzed' :
+                            isSkipped  ? 'Skipped – Gujarati SOP' :
+                            isFailed   ? 'Failed' :
+                            isCurrent  ? 'In progress' : 'Pending'
+                          }
+                          className={`w-4 h-4 rounded transition-all duration-300 ${
+                            isCached   ? 'bg-blue-400' :
+                            isNewDone  ? 'bg-emerald-500' :
+                            isSkipped  ? 'bg-slate-300' :
+                            isFailed   ? 'bg-rose-400' :
+                            isCurrent  ? 'bg-purple-500 ring-2 ring-purple-300 animate-pulse' :
+                                         'bg-gray-200'
+                          }`}
+                        />
+                      );
+                    })}
+                  </div>
+                  <div className="flex flex-wrap gap-4 mt-3">
+                    {[
+                      { color: 'bg-blue-400',    label: 'Existing (Cached)' },
+                      { color: 'bg-emerald-500', label: 'Newly Analyzed' },
+                      { color: 'bg-slate-300',   label: 'Skipped (GUJ)' },
+                      { color: 'bg-purple-500',  label: 'In Progress' },
+                      { color: 'bg-rose-400',    label: 'Failed' },
+                      { color: 'bg-gray-200',    label: 'Pending' },
+                    ].map(l => (
+                      <div key={l.label} className="flex items-center gap-1.5 text-[10px] text-gray-500 font-semibold">
+                        <div className={`w-3 h-3 rounded ${l.color}`} />
+                        {l.label}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Latest result card ─────────────────────────────── */}
+              {currentResult && (
+                <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-5">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Latest Result</span>
+                    {currentResult.complianceStatus && (
+                      <span className={`px-2.5 py-1 rounded-lg text-xs font-bold border ${getStatusColor(currentResult.complianceStatus)}`}>
+                        {currentResult.complianceStatus}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-base font-bold text-gray-800 leading-tight mb-0.5">{currentResult.sopName}</p>
+                  <p className="text-xs text-gray-400 font-mono mb-3">{currentResult.sopIdentifier}</p>
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="text-sm text-gray-500 font-medium">Score</span>
+                    <span className={`text-2xl font-black ${getScoreColor(currentResult.overallScore)}`}>
+                      {typeof currentResult.overallScore === 'number' ? currentResult.overallScore : 'N/A'}
+                    </span>
+                    {typeof currentResult.overallScore === 'number' && (
+                      <span className="text-sm text-gray-400 font-bold">/10</span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Completion actions ─────────────────────────────── */}
+              {analysisComplete && (
+                <div className="bg-white rounded-2xl border border-emerald-200 shadow-sm p-5">
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="w-10 h-10 rounded-xl bg-emerald-100 flex items-center justify-center text-xl">✅</div>
+                    <div>
+                      <p className="font-bold text-gray-800">Analysis complete</p>
+                      <p className="text-xs text-gray-500">
+                        {completed - skipped - sopLists.cached.length} new
+                        {sopLists.cached.length > 0 ? ` · ${sopLists.cached.length} cached` : ''}
+                        {skipped > 0 ? ` · ${skipped} GUJ skipped` : ''}
+                        {failed > 0 ? ` · ${failed} failed` : ''}
+                        {' · '}{total} total
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      onClick={runFullAnalysis}
+                      disabled={isAnalyzing || sops.length === 0 || guidelines.length === 0}
+                      className="flex-1 px-5 py-2.5 bg-white border border-purple-200 text-purple-700 rounded-xl font-bold hover:bg-purple-50 transition-all disabled:opacity-50 text-sm"
+                    >
+                      ↻ Re-run Analysis
+                    </button>
                     <button
                       onClick={() => setCurrentStep('results')}
-                      className="px-8 py-3 bg-purple-600 text-white rounded-xl font-bold hover:bg-purple-700 transition-all shadow-lg shadow-purple-200"
+                      className="flex-1 px-5 py-2.5 bg-purple-600 text-white rounded-xl font-bold hover:bg-purple-700 transition-all shadow-md shadow-purple-200 text-sm"
                     >
                       View Full Report →
                     </button>
                   </div>
-                )}
-              </div>
+                </div>
+              )}
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* Step 5: Results */}
         {currentStep === 'results' && (
@@ -1475,13 +2223,20 @@ export default function ComplianceEnginePage() {
                         </span>
                         <div className="flex items-center gap-2">
                            <div className={`w-3 h-3 rounded-full ${
+                             (report.complianceStatus === 'Analysis Pending' || report.complianceStatus === 'Analysis Failed') ? 'bg-blue-400' :
                              report.overallScore >= 7 ? 'bg-emerald-500' :
                              report.overallScore >= 4 ? 'bg-amber-500' :
                              'bg-rose-500'
                            }`} />
                            <div className="text-lg font-black text-gray-800">
-                             <span className={getScoreColor(report.overallScore)}>{report.overallScore}</span>
-                             <span className="text-gray-400 text-xs">/10</span>
+                             {(report.complianceStatus === 'Analysis Pending' || report.complianceStatus === 'Analysis Failed') ? (
+                               <span className="text-blue-500">N/A</span>
+                             ) : (
+                               <>
+                                 <span className={getScoreColor(report.overallScore)}>{report.overallScore}</span>
+                                 <span className="text-gray-400 text-xs">/10</span>
+                               </>
+                             )}
                            </div>
                         </div>
                       </div>
@@ -1510,41 +2265,53 @@ export default function ComplianceEnginePage() {
               <div className={`${isFullScreen ? 'h-full' : 'xl:col-span-8'} flex flex-col gap-6 overflow-hidden animate-in fade-in slide-in-from-right-4 duration-300`}>
                 
                 {/* 1. Header Card */}
-                <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-5 relative overflow-hidden flex-shrink-0">
-                  <div className="flex flex-row justify-between items-center gap-6">
-                    <div className="flex items-center gap-6">
-                      {/* Score Indicator */}
-                      <div className="flex items-baseline gap-1.5">
-                        <span className={`text-5xl font-black tracking-tighter ${getScoreColor(selectedReport.overallScore)}`}>
-                          {selectedReport.overallScore}
-                        </span>
-                        <span className="text-xl font-bold text-gray-400">/10</span>
+                <div className="bg-white rounded-2xl border border-gray-200 shadow-sm flex-shrink-0 overflow-hidden">
+                  {/* Thin status accent bar at top */}
+                  <div className={`h-1 w-full ${
+                    (selectedReport.complianceStatus === 'Analysis Pending' || selectedReport.complianceStatus === 'Analysis Failed') ? 'bg-blue-400' :
+                    selectedReport.overallScore >= 7 ? 'bg-emerald-500' :
+                    selectedReport.overallScore >= 4 ? 'bg-amber-400' :
+                    'bg-rose-500'
+                  }`} />
+                  <div className="p-5 flex flex-row justify-between items-center gap-4">
+                    <div className="flex items-center gap-5">
+                      {/* Score circle */}
+                      <div className={`w-16 h-16 rounded-2xl flex flex-col items-center justify-center flex-shrink-0 ${
+                        (selectedReport.complianceStatus === 'Analysis Pending' || selectedReport.complianceStatus === 'Analysis Failed') ? 'bg-blue-50 border border-blue-200' :
+                        selectedReport.overallScore >= 7 ? 'bg-emerald-50 border border-emerald-200' :
+                        selectedReport.overallScore >= 4 ? 'bg-amber-50 border border-amber-200' :
+                        'bg-rose-50 border border-rose-200'
+                      }`}>
+                        {(selectedReport.complianceStatus === 'Analysis Pending' || selectedReport.complianceStatus === 'Analysis Failed') ? (
+                          <span className="text-xl font-black text-blue-600">N/A</span>
+                        ) : (
+                          <>
+                            <span className={`text-2xl font-black leading-none ${getScoreColor(selectedReport.overallScore)}`}>
+                              {selectedReport.overallScore}
+                            </span>
+                            <span className="text-[10px] font-bold text-gray-400">/10</span>
+                          </>
+                        )}
                       </div>
 
-                      <div className="h-10 w-px bg-gray-200" />
-
-                      <div className="space-y-0.5">
-                        <p className="text-purple-600 text-[10px] font-black uppercase tracking-[0.2em] leading-none">{selectedReport.department}</p>
-                        <p className={`text-lg font-black tracking-tight ${getScoreColor(selectedReport.overallScore)} leading-tight`}>
-                          {selectedReport.complianceStatus}
+                      <div>
+                        <p className="text-[10px] font-black text-purple-600 uppercase tracking-[0.2em] mb-0.5">{selectedReport.department}</p>
+                        <p className="text-gray-800 font-bold text-sm leading-tight mb-1 max-w-xs truncate" title={selectedReport.sopName}>
+                          {selectedReport.sopName}
                         </p>
+                        <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold border ${getStatusColor(selectedReport.complianceStatus)}`}>
+                          {selectedReport.complianceStatus}
+                        </span>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-4">
-                      <div className={`w-12 h-12 rounded-full ${
-                        selectedReport.overallScore >= 7 ? 'bg-emerald-500' :
-                        selectedReport.overallScore >= 4 ? 'bg-amber-500' :
-                        'bg-rose-500'
-                      }`} />
-
-                      <button
-                        onClick={() => setIsFullScreen(!isFullScreen)}
-                        className="p-2.5 bg-gray-50 hover:bg-gray-100 text-gray-500 rounded-xl transition-all border border-gray-200 hover:scale-110 active:scale-95"
-                      >
-                        {isFullScreen ? '↙️' : '↗️'}
-                      </button>
-                    </div>
+                    <button
+                      onClick={() => setIsFullScreen(!isFullScreen)}
+                      className="p-2.5 bg-gray-50 hover:bg-purple-50 text-gray-500 hover:text-purple-600 rounded-xl transition-all border border-gray-200 hover:border-purple-300 flex-shrink-0"
+                      title={isFullScreen ? 'Exit fullscreen' : 'Fullscreen'}
+                    >
+                      {isFullScreen ? '↙️' : '↗️'}
+                    </button>
                   </div>
                 </div>
 
@@ -1572,94 +2339,136 @@ export default function ComplianceEnginePage() {
                   </div>
 
                   {/* Filterable Summary Stats */}
-                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                     {/* Total Checked */}
-                     <div className="p-6 bg-blue-50 rounded-2xl border border-blue-200 flex flex-col justify-between">
-                        <div className="flex justify-between items-center mb-4">
-                          <p className="text-xs font-bold text-blue-600 uppercase tracking-widest">Total Checked</p>
-                          <span className="text-2xl">📋</span>
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                    {/* Total Checked */}
+                    <div className="p-5 bg-white border border-gray-200 rounded-2xl shadow-sm flex flex-col justify-between">
+                      <div className="flex items-center justify-between mb-3">
+                        <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Total Checked</p>
+                        <div className="w-7 h-7 rounded-lg bg-purple-100 flex items-center justify-center">
+                          <span className="text-sm">📋</span>
                         </div>
-                        <p className="text-4xl font-black text-gray-800">{selectedReport.findings?.length || 0}</p>
-                     </div>
+                      </div>
+                      <p className="text-3xl font-black text-gray-800">{selectedReport.findings?.length || 0}</p>
+                      <p className="text-[10px] text-gray-400 mt-1">clauses analyzed</p>
+                    </div>
 
-                     {/* Compliant Filter */}
-                     <button
-                       onClick={() => setFilterStatus(filterStatus === 'compliant' ? 'all' : 'compliant')}
-                       className={`p-6 rounded-2xl border transition-all text-left flex flex-col justify-between ${
-                         filterStatus === 'compliant' ? 'bg-emerald-100 border-emerald-400 ring-2 ring-emerald-300 shadow-md' : 'bg-emerald-50 border-emerald-200 hover:border-emerald-400'
-                       }`}
-                     >
-                        <div className="flex justify-between items-center mb-4">
-                          <p className="text-xs font-bold text-emerald-700 uppercase tracking-widest">Compliant</p>
-                          <span className="text-2xl">✅</span>
+                    {/* Compliant Filter */}
+                    <button
+                      onClick={() => setFilterStatus(filterStatus === 'compliant' ? 'all' : 'compliant')}
+                      className={`p-5 rounded-2xl border transition-all text-left flex flex-col justify-between shadow-sm ${
+                        filterStatus === 'compliant'
+                          ? 'bg-emerald-600 border-emerald-600 shadow-emerald-200 shadow-md'
+                          : 'bg-white border-gray-200 hover:border-emerald-300 hover:shadow-emerald-100'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <p className={`text-[10px] font-black uppercase tracking-widest ${filterStatus === 'compliant' ? 'text-emerald-100' : 'text-emerald-600'}`}>
+                          Compliant
+                        </p>
+                        <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${filterStatus === 'compliant' ? 'bg-emerald-500' : 'bg-emerald-50'}`}>
+                          <span className="text-sm">✅</span>
                         </div>
-                        <p className="text-4xl font-black text-emerald-700">{selectedReport.compliantCount}</p>
-                     </button>
+                      </div>
+                      <p className={`text-3xl font-black ${filterStatus === 'compliant' ? 'text-white' : 'text-emerald-700'}`}>
+                        {selectedReport.compliantCount}
+                      </p>
+                      <p className={`text-[10px] mt-1 ${filterStatus === 'compliant' ? 'text-emerald-200' : 'text-gray-400'}`}>
+                        {Math.round((selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100)}% of total
+                      </p>
+                    </button>
 
-                     {/* Partial Filter */}
-                     <button
-                       onClick={() => setFilterStatus(filterStatus === 'partial' ? 'all' : 'partial')}
-                       className={`p-6 rounded-2xl border transition-all text-left flex flex-col justify-between ${
-                         filterStatus === 'partial' ? 'bg-amber-100 border-amber-400 ring-2 ring-amber-300 shadow-md' : 'bg-amber-50 border-amber-200 hover:border-amber-400'
-                       }`}
-                     >
-                        <div className="flex justify-between items-center mb-4">
-                          <p className="text-xs font-bold text-amber-700 uppercase tracking-widest">Partial</p>
-                          <span className="text-2xl">⚠️</span>
+                    {/* Partial Filter */}
+                    <button
+                      onClick={() => setFilterStatus(filterStatus === 'partial' ? 'all' : 'partial')}
+                      className={`p-5 rounded-2xl border transition-all text-left flex flex-col justify-between shadow-sm ${
+                        filterStatus === 'partial'
+                          ? 'bg-amber-500 border-amber-500 shadow-amber-200 shadow-md'
+                          : 'bg-white border-gray-200 hover:border-amber-300 hover:shadow-amber-100'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <p className={`text-[10px] font-black uppercase tracking-widest ${filterStatus === 'partial' ? 'text-amber-100' : 'text-amber-600'}`}>
+                          Partial
+                        </p>
+                        <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${filterStatus === 'partial' ? 'bg-amber-400' : 'bg-amber-50'}`}>
+                          <span className="text-sm">⚠️</span>
                         </div>
-                        <div className="flex items-baseline gap-2">
-                            <p className="text-4xl font-black text-amber-700">{selectedReport.partialCount}</p>
-                            <p className="text-xs font-bold text-amber-500 font-mono">
-                              ({Math.round((selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100)}%)
-                            </p>
-                        </div>
-                     </button>
+                      </div>
+                      <p className={`text-3xl font-black ${filterStatus === 'partial' ? 'text-white' : 'text-amber-700'}`}>
+                        {selectedReport.partialCount}
+                      </p>
+                      <p className={`text-[10px] mt-1 ${filterStatus === 'partial' ? 'text-amber-100' : 'text-gray-400'}`}>
+                        {Math.round((selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100)}% of total
+                      </p>
+                    </button>
 
-                     {/* Non-Compliant Filter */}
-                     <button
-                       onClick={() => setFilterStatus(filterStatus === 'non-compliant' ? 'all' : 'non-compliant')}
-                       className={`p-6 rounded-2xl border transition-all text-left flex flex-col justify-between ${
-                         filterStatus === 'non-compliant' ? 'bg-rose-100 border-rose-400 ring-2 ring-rose-300 shadow-md' : 'bg-rose-50 border-rose-200 hover:border-rose-400'
-                       }`}
-                     >
-                        <div className="flex justify-between items-center mb-4">
-                          <p className="text-xs font-bold text-rose-700 uppercase tracking-widest">Non-Compliant</p>
-                          <span className="text-2xl">❌</span>
+                    {/* Non-Compliant Filter */}
+                    <button
+                      onClick={() => setFilterStatus(filterStatus === 'non-compliant' ? 'all' : 'non-compliant')}
+                      className={`p-5 rounded-2xl border transition-all text-left flex flex-col justify-between shadow-sm ${
+                        filterStatus === 'non-compliant'
+                          ? 'bg-rose-600 border-rose-600 shadow-rose-200 shadow-md'
+                          : 'bg-white border-gray-200 hover:border-rose-300 hover:shadow-rose-100'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <p className={`text-[10px] font-black uppercase tracking-widest ${filterStatus === 'non-compliant' ? 'text-rose-100' : 'text-rose-600'}`}>
+                          Non-Compliant
+                        </p>
+                        <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${filterStatus === 'non-compliant' ? 'bg-rose-500' : 'bg-rose-50'}`}>
+                          <span className="text-sm">❌</span>
                         </div>
-                        <div className="flex items-baseline gap-2">
-                            <p className="text-4xl font-black text-rose-700">{selectedReport.nonCompliantCount}</p>
-                            <p className="text-xs font-bold text-rose-400 font-mono">
-                              ({Math.round((selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100)}%)
-                            </p>
-                        </div>
-                     </button>
+                      </div>
+                      <p className={`text-3xl font-black ${filterStatus === 'non-compliant' ? 'text-white' : 'text-rose-700'}`}>
+                        {selectedReport.nonCompliantCount}
+                      </p>
+                      <p className={`text-[10px] mt-1 ${filterStatus === 'non-compliant' ? 'text-rose-200' : 'text-gray-400'}`}>
+                        {Math.round((selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100)}% of total
+                      </p>
+                    </button>
                   </div>
 
                   {/* 3. Compliance Distribution */}
-                  <div className="bg-white rounded-2xl border border-gray-200 p-5">
-                    <div className="flex justify-between items-center mb-3">
-                      <p className="text-xs font-bold text-gray-500 uppercase tracking-widest">Compliance Distribution</p>
-                      <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">{selectedReport.findings?.length || 0} applicable clauses</p>
+                  <div className="bg-white rounded-2xl border border-gray-200 p-5 shadow-sm">
+                    <div className="flex justify-between items-center mb-4">
+                      <p className="text-xs font-bold text-gray-700 flex items-center gap-2">
+                        Compliance Distribution
+                      </p>
+                      <p className="text-[10px] text-gray-400 font-semibold">{selectedReport.findings?.length || 0} clauses analyzed</p>
                     </div>
-                    <div className="h-4 w-full bg-gray-100 rounded-full overflow-hidden flex shadow-inner border border-gray-200">
-                      <div 
-                        className="bg-emerald-500 h-full transition-all duration-1000 flex items-center justify-center text-[10px] font-bold text-white"
-                        style={{ width: `${(selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100}%` }}
-                      >
-                        {selectedReport.compliantCount > 0 && Math.round((selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100) > 5 && `${Math.round((selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100)}%`}
-                      </div>
-                      <div 
-                        className="bg-amber-500 h-full transition-all duration-1000 flex items-center justify-center text-[10px] font-bold text-white"
-                        style={{ width: `${(selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100}%` }}
-                      >
-                        {selectedReport.partialCount > 0 && Math.round((selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100) > 5 && `${Math.round((selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100)}%`}
-                      </div>
-                      <div 
-                        className="bg-rose-500 h-full transition-all duration-1000 flex items-center justify-center text-[10px] font-bold text-white shadow-[inset_0_0_10px_rgba(0,0,0,0.1)]"
-                        style={{ width: `${(selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100}%` }}
-                      >
-                        {selectedReport.nonCompliantCount > 0 && Math.round((selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100) > 5 && `${Math.round((selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100)}%`}
-                      </div>
+                    {/* Progress bar */}
+                    <div className="h-3 w-full bg-gray-100 rounded-full overflow-hidden flex border border-gray-200">
+                      {selectedReport.compliantCount > 0 && (
+                        <div
+                          className="bg-emerald-500 h-full transition-all duration-700"
+                          style={{ width: `${(selectedReport.compliantCount / (selectedReport.findings?.length || 1)) * 100}%` }}
+                        />
+                      )}
+                      {selectedReport.partialCount > 0 && (
+                        <div
+                          className="bg-amber-400 h-full transition-all duration-700"
+                          style={{ width: `${(selectedReport.partialCount / (selectedReport.findings?.length || 1)) * 100}%` }}
+                        />
+                      )}
+                      {selectedReport.nonCompliantCount > 0 && (
+                        <div
+                          className="bg-rose-500 h-full transition-all duration-700"
+                          style={{ width: `${(selectedReport.nonCompliantCount / (selectedReport.findings?.length || 1)) * 100}%` }}
+                        />
+                      )}
+                    </div>
+                    {/* Legend */}
+                    <div className="flex flex-wrap gap-4 mt-3">
+                      {[
+                        { label: 'Compliant', count: selectedReport.compliantCount, color: 'bg-emerald-500' },
+                        { label: 'Partial', count: selectedReport.partialCount, color: 'bg-amber-400' },
+                        { label: 'Non-Compliant', count: selectedReport.nonCompliantCount, color: 'bg-rose-500' },
+                      ].map(item => (
+                        <div key={item.label} className="flex items-center gap-1.5 text-[10px] text-gray-500 font-semibold">
+                          <div className={`w-2 h-2 rounded-full ${item.color}`} />
+                          {item.label} <span className="text-gray-700 font-black">{item.count}</span>
+                        </div>
+                      ))}
                     </div>
                   </div>
 
@@ -1772,7 +2581,7 @@ export default function ComplianceEnginePage() {
                       </div>
                     </div>
 
-                    <div className="p-6 space-y-6 bg-gray-50 min-h-[400px]">
+                    <div className="p-5 space-y-4 bg-gray-50/50 min-h-[400px]">
                       {selectedReport.findings && selectedReport.findings.length > 0
                         ? visibleFindings.map(({ f: finding, i: globalIdx }) => {
                             const isSelected = selectedFindingIds.has(globalIdx);

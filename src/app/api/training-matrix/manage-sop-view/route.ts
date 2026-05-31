@@ -1,31 +1,56 @@
-import connectDB from '@/lib/mongodb';
-import MatrixSOPAssignment from '@/models/MatrixSOPAssignment';
-import TrainingMatrixRecord from '@/models/TrainingMatrixRecord';
-import TrainingMatrixUpload from '@/models/TrainingMatrixUpload';
-import Employee from '@/models/Employee';
-import SOP from '@/models/SOP';
-import SOPLibrary from '@/models/SOPLibrary';
-import MasterSOPRepository from '@/models/MasterSOPRepository';
-import { getDashboardSopsCache } from '@/lib/dashboardSopsCache';
-import { getDashboardRegistryPayload } from '@/lib/dashboardRegistrySource';
+import connectDB from "@/lib/mongodb";
+import MatrixSOPAssignment from "@/models/MatrixSOPAssignment";
+import TrainingMatrixRecord from "@/models/TrainingMatrixRecord";
+import TrainingMatrixUpload from "@/models/TrainingMatrixUpload";
+import Employee from "@/models/Employee";
+import SOP from "@/models/SOP";
+import SOPLibrary from "@/models/SOPLibrary";
+import MasterSOPRepository from "@/models/MasterSOPRepository";
+import { getDashboardSopsCache } from "@/lib/dashboardSopsCache";
+import { getDashboardRegistryPayload } from "@/lib/dashboardRegistrySource";
 import {
   getTrainingMatrixCached as getTrainingMatrixOverviewCached,
   invalidateTrainingMatrixCache,
-} from '@/lib/trainingMatrixCache';
+} from "@/lib/trainingMatrixCache";
 import {
   getManageSopViewCached,
   invalidateManageSopViewCache,
   setManageSopViewCached,
-} from '@/lib/manageSopViewCache';
-import { filterPrimaryRegistryRowsUniqueByFamily } from '@/lib/registryPrimaryRows';
-import { NextRequest, NextResponse } from 'next/server';
+} from "@/lib/manageSopViewCache";
+import { filterPrimaryRegistryRowsUniqueByFamily } from "@/lib/registryPrimaryRows";
+import { NextRequest, NextResponse } from "next/server";
 
-const DEFAULT_DEPARTMENTS = ['QA', 'QC', 'Microbiology', 'Production', 'Store', 'Engineering', 'Personnel'];
-const MONTH_NAMES = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-const MANAGE_SOP_API_LOG = '[manage-sop][api]';
+const DEFAULT_DEPARTMENTS = [
+  "QA",
+  "QC",
+  "Microbiology",
+  "Production",
+  "Store",
+  "Engineering",
+  "Personnel",
+];
+const MONTH_NAMES = [
+  "",
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+const MANAGE_SOP_API_LOG = "[manage-sop][api]";
 
 function nowMs(): number {
-  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+  if (
+    typeof performance !== "undefined" &&
+    typeof performance.now === "function"
+  ) {
     return performance.now();
   }
   return Date.now();
@@ -37,7 +62,10 @@ function elapsedMs(startMs: number): number {
 
 // Same revision stripping as training-matrix/overview (dbSopCount universe).
 function stripVersion(code: string): string {
-  return String(code || '').toUpperCase().replace(/-\d+$/, '').trim();
+  return String(code || "")
+    .toUpperCase()
+    .replace(/-\d+$/, "")
+    .trim();
 }
 
 // Keep designation matching resilient across historical data formats:
@@ -45,15 +73,20 @@ function stripVersion(code: string): string {
 // - short codes: "SE"
 // - packed strings: "SE, EX, CH"
 function desigAbbr(designation: string): string {
-  const cleaned = String(designation || '').replace(/[^a-zA-Z ]/g, '').trim();
+  const cleaned = String(designation || "")
+    .replace(/[^a-zA-Z ]/g, "")
+    .trim();
   const parts = cleaned.split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return '';
+  if (parts.length === 0) return "";
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return `${parts[0][0] || ''}${parts[1][0] || ''}`.toUpperCase();
+  return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
 }
 
 function normalizeDesignationToken(input: string): string {
-  return String(input || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  return String(input || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 }
 
 export interface SOPViewDesignationStat {
@@ -116,23 +149,23 @@ export interface ManageSOPViewResponse {
   // after a refresh — the MatrixSOPAssignment fallback alone misses these because
   // manual allocations don't write to MatrixSOPAssignment.
   manualDesignations: Record<string, Record<string, string[]>>;
-  year: number | 'all';
+  year: number | "all";
 }
 
-export const dynamic = 'force-dynamic';
+export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
   const reqStartMs = nowMs();
   try {
     const searchParams = request.nextUrl.searchParams;
-    const yearParam = searchParams.get('year');
-    const forceFresh = searchParams.get('refresh') === '1';
+    const yearParam = searchParams.get("year");
+    const forceFresh = searchParams.get("refresh") === "1";
     // year=all (or omitted) → count training across every year, matching the source-of-truth
     // "main training matrix" view. A numeric year still scopes to that one year.
-    const yearAll = !yearParam || yearParam === 'all';
-    const year = yearAll ? 0 : (parseInt(yearParam) || new Date().getFullYear());
-    const search = searchParams.get('search')?.toLowerCase() || '';
-    const cacheYear: number | 'all' = yearAll ? 'all' : year;
+    const yearAll = !yearParam || yearParam === "all";
+    const year = yearAll ? 0 : parseInt(yearParam) || new Date().getFullYear();
+    const search = searchParams.get("search")?.toLowerCase() || "";
+    const cacheYear: number | "all" = yearAll ? "all" : year;
 
     if (!forceFresh) {
       const cacheLookupStartMs = nowMs();
@@ -151,41 +184,64 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
     // Filter out non-applicable rows — 'na' means the SOP doesn't apply to that employee
     // and should never count as a training event.
-    const recordMatch: Record<string, any> = { status: { $ne: 'na' } };
+    const recordMatch: Record<string, any> = { status: { $ne: "na" } };
     if (!yearAll) recordMatch.year = year;
 
     const dataFetchStartMs = nowMs();
     // Parallel queries - fetch from training matrix data + cached payloads + fallback name sources
-    const [assignments, trainingAgg, manualRecords, employees, allSOPs, libraryDocs, masterDocs, scheduleUploads, dashboardCached, overviewCached] = await Promise.all([
+    const [
+      assignments,
+      trainingAgg,
+      manualRecords,
+      employees,
+      allSOPs,
+      libraryDocs,
+      masterDocs,
+      scheduleUploads,
+      dashboardCached,
+      overviewCached,
+    ] = await Promise.all([
       MatrixSOPAssignment.find({ isActive: true })
-        .select('sopCode sopName department designationApplicability')
+        .select("sopCode sopName department designationApplicability")
         .lean(),
       TrainingMatrixRecord.aggregate([
         { $match: recordMatch },
         {
           $group: {
-            _id: { sopCode: '$sopCode', department: '$department', designation: '$designation', month: '$month' },
-            count: { $sum: 1 }
-          }
-        }
+            _id: {
+              sopCode: "$sopCode",
+              department: "$department",
+              designation: "$designation",
+              month: "$month",
+            },
+            count: { $sum: 1 },
+          },
+        },
       ]),
       // Only records inserted by the Manage SOP page's Update action — used to
       // reconstruct exactly which (sopCode, dept, month) cells the user allocated
       // (plus which designations) so the UI highlight survives a refresh without
       // flagging unrelated historical training records.
-      TrainingMatrixRecord.find({ ...recordMatch, sourceFile: 'manage-sop-manual' })
-        .select('sopCode department month designation')
+      TrainingMatrixRecord.find({
+        ...recordMatch,
+        sourceFile: "manage-sop-manual",
+      })
+        .select("sopCode department month designation")
         .lean(),
       Employee.find({ isActive: true })
-        .select('department designation name')
+        .select("department designation name")
         .lean(),
-      SOP.find().select('identifier name language').lean(),
-      SOPLibrary.find().select('sopIdentifier sopName language department').lean(),
-      MasterSOPRepository.find().select('sopIdentifier sopName language department').lean(),
+      SOP.find().select("identifier name language").lean(),
+      SOPLibrary.find()
+        .select("sopIdentifier sopName language department")
+        .lean(),
+      MasterSOPRepository.find()
+        .select("sopIdentifier sopName language department")
+        .lean(),
       // Department-level schedule snapshots — source of truth for which SOPs run in
       // which month. Sort by latest upload so the most recent schedule wins per dept.
-      TrainingMatrixUpload.find({ 'snapshot.sopMonthMap': { $exists: true } })
-        .select('department snapshot.sopMonthMap uploadedAt year')
+      TrainingMatrixUpload.find({ "snapshot.sopMonthMap": { $exists: true } })
+        .select("department snapshot.sopMonthMap uploadedAt year")
         .sort({ uploadedAt: -1 })
         .lean(),
       getDashboardSopsCache(),
@@ -202,21 +258,21 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       if (!raw) return null;
       const u = String(raw).trim().toUpperCase();
       if (!u) return null;
-      if (u === 'QA') return 'QA';
-      if (u === 'QC') return 'QC';
-      if (u.startsWith('MICRO')) return 'Microbiology';
-      if (u.startsWith('PROD')) return 'Production';
-      if (u.startsWith('STORE') || u === 'STOR') return 'Store';
-      if (u.startsWith('ENG')) return 'Engineering';
-      if (u.startsWith('PERSON') || u === 'HR') return 'Personnel';
-      const direct = DEFAULT_DEPARTMENTS.find(d => d.toUpperCase() === u);
+      if (u === "QA") return "QA";
+      if (u === "QC") return "QC";
+      if (u.startsWith("MICRO")) return "Microbiology";
+      if (u.startsWith("PROD")) return "Production";
+      if (u.startsWith("STORE") || u === "STOR") return "Store";
+      if (u.startsWith("ENG")) return "Engineering";
+      if (u.startsWith("PERSON") || u === "HR") return "Personnel";
+      const direct = DEFAULT_DEPARTMENTS.find((d) => d.toUpperCase() === u);
       return direct || null;
     };
 
     const monthNameToNum = (name: string): number | null => {
       if (!name) return null;
       const idx = MONTH_NAMES.findIndex(
-        m => m && m.toLowerCase() === String(name).trim().toLowerCase()
+        (m) => m && m.toLowerCase() === String(name).trim().toLowerCase(),
       );
       return idx > 0 ? idx : null;
     };
@@ -242,8 +298,15 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     // canonical SOP universe (427) is still correct (especially on refresh=1).
     let registryRows: any[] = [];
     try {
-      let dashboard = (dashboardCached?.payload || null) as { success?: boolean; data?: any[] } | null;
-      if (!dashboard || !Array.isArray(dashboard?.data) || dashboard.data.length === 0) {
+      let dashboard = (dashboardCached?.payload || null) as {
+        success?: boolean;
+        data?: any[];
+      } | null;
+      if (
+        !dashboard ||
+        !Array.isArray(dashboard?.data) ||
+        dashboard.data.length === 0
+      ) {
         dashboard = await getDashboardRegistryPayload(request.nextUrl.origin);
       }
       registryRows = Array.isArray(dashboard?.data) ? dashboard.data : [];
@@ -262,7 +325,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     const canonicalRows = filterPrimaryRegistryRowsUniqueByFamily(registryRows);
     const canonicalBaseSet = new Set<string>();
     for (const row of canonicalRows as any[]) {
-      const id = String(row?.sopNo || row?.identifier || '').trim();
+      const id = String(row?.sopNo || row?.identifier || "").trim();
       if (!id) continue;
       const base = stripVersion(id);
       if (base) canonicalBaseSet.add(base);
@@ -270,15 +333,23 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
     // Exact DB SOP universe from Training Matrix overview (dbSopCount, e.g. 427).
     const overviewDbSopCodes = new Map<string, string>();
-    const overviewByDept = (overviewCached as { totalCard?: { dbSopsByDept?: Record<string, Array<{ sopCode?: string; title?: string }>> } } | null)
-      ?.totalCard?.dbSopsByDept;
+    const overviewByDept = (
+      overviewCached as {
+        totalCard?: {
+          dbSopsByDept?: Record<
+            string,
+            Array<{ sopCode?: string; title?: string }>
+          >;
+        };
+      } | null
+    )?.totalCard?.dbSopsByDept;
     if (overviewByDept) {
       for (const list of Object.values(overviewByDept)) {
         if (!Array.isArray(list)) continue;
         for (const item of list) {
-          const base = stripVersion(String(item?.sopCode || ''));
+          const base = stripVersion(String(item?.sopCode || ""));
           if (!base || overviewDbSopCodes.has(base)) continue;
-          overviewDbSopCodes.set(base, String(item?.title || '').trim());
+          overviewDbSopCodes.set(base, String(item?.title || "").trim());
         }
       }
     }
@@ -287,7 +358,10 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     // plus the resolved roster (name + designation) used by the Employees view.
     const designationsByDept = new Map<string, Set<string>>();
     const empCountMap = new Map<string, Map<string, number>>();
-    const empRoster = new Map<string, Array<{ name: string; designation: string }>>();
+    const empRoster = new Map<
+      string,
+      Array<{ name: string; designation: string }>
+    >();
     for (const dept of DEFAULT_DEPARTMENTS) {
       designationsByDept.set(dept, new Set<string>());
       empCountMap.set(dept, new Map<string, number>());
@@ -298,20 +372,28 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       const set = designationsByDept.get(emp.department);
       if (set) set.add(emp.designation as string);
       const deptMap = empCountMap.get(emp.department);
-      if (deptMap) deptMap.set(emp.designation as string, (deptMap.get(emp.designation as string) ?? 0) + 1);
+      if (deptMap)
+        deptMap.set(
+          emp.designation as string,
+          (deptMap.get(emp.designation as string) ?? 0) + 1,
+        );
       const roster = empRoster.get(emp.department);
-      const name = String((emp as any).name || '').trim();
-      if (roster && name) roster.push({ name, designation: emp.designation as string });
+      const name = String((emp as any).name || "").trim();
+      if (roster && name)
+        roster.push({ name, designation: emp.designation as string });
     }
     for (const list of empRoster.values()) {
       list.sort((a, b) => a.name.localeCompare(b.name));
     }
 
     // Build training data map: sopCode → dept → designation → month → count
-    const trainingMap = new Map<string, Map<string, Map<string, Map<number, number>>>>();
+    const trainingMap = new Map<
+      string,
+      Map<string, Map<string, Map<number, number>>>
+    >();
     for (const record of trainingAgg) {
       const id = record._id as any;
-      const stripCode = stripVersion(id.sopCode || '');
+      const stripCode = stripVersion(id.sopCode || "");
       if (!trainingMap.has(stripCode)) {
         trainingMap.set(stripCode, new Map());
       }
@@ -339,41 +421,49 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
         assignmentMap.set(stripCode, new Map());
       }
       const deptMap = assignmentMap.get(stripCode)!;
-      deptMap.set(assignment.department, assignment.designationApplicability || []);
+      deptMap.set(
+        assignment.department,
+        assignment.designationApplicability || [],
+      );
     }
 
     // Clean a name string by taking the last path segment and stripping any leading "CODE-VV"
     // prefix. Handles values stored as folder paths like:
     //   "5. STORE/BSGE - BSR---/BSGE01-05/BSGE01-05_HANDLING AND DISTRIBUTION OF FINISHED GOODS"
     const cleanName = (raw: string | undefined | null): string => {
-      if (!raw) return '';
+      if (!raw) return "";
       let s = String(raw).trim();
-      if (!s) return '';
+      if (!s) return "";
       // If a path, take the last meaningful segment
-      if (s.includes('/')) {
-        const parts = s.split('/').map(p => p.trim()).filter(Boolean);
+      if (s.includes("/")) {
+        const parts = s
+          .split("/")
+          .map((p) => p.trim())
+          .filter(Boolean);
         if (parts.length) s = parts[parts.length - 1];
       }
       // Strip leading code prefix: "BSGE01-05_", "BSGE01-05 - ", "MAGE02-06 "
-      s = s.replace(/^[A-Za-z]+\d+(?:[-.]\d+)*[\s_-]*/, '').trim();
+      s = s.replace(/^[A-Za-z]+\d+(?:[-.]\d+)*[\s_-]*/, "").trim();
       return s;
     };
 
     // Map normalized DB department values back to the canonical names used by the UI
     // (MasterSOPRepository stores them uppercase, sometimes with extra words).
-    const normalizeDeptValue = (raw: string | undefined | null): string | null => {
+    const normalizeDeptValue = (
+      raw: string | undefined | null,
+    ): string | null => {
       if (!raw) return null;
       const u = String(raw).trim().toUpperCase();
       if (!u) return null;
-      if (u === 'QA') return 'QA';
-      if (u === 'QC') return 'QC';
-      if (u.startsWith('MICRO')) return 'Microbiology';
-      if (u.startsWith('PROD')) return 'Production';
-      if (u.startsWith('STORE') || u === 'BS' || u === 'STOR') return 'Store';
-      if (u.startsWith('ENG')) return 'Engineering';
-      if (u.startsWith('PERSON') || u.startsWith('HR')) return 'Personnel';
+      if (u === "QA") return "QA";
+      if (u === "QC") return "QC";
+      if (u.startsWith("MICRO")) return "Microbiology";
+      if (u.startsWith("PROD")) return "Production";
+      if (u.startsWith("STORE") || u === "BS" || u === "STOR") return "Store";
+      if (u.startsWith("ENG")) return "Engineering";
+      if (u.startsWith("PERSON") || u.startsWith("HR")) return "Personnel";
       // Direct match against the canonical list (rare)
-      const direct = DEFAULT_DEPARTMENTS.find(d => d.toUpperCase() === u);
+      const direct = DEFAULT_DEPARTMENTS.find((d) => d.toUpperCase() === u);
       return direct || null;
     };
 
@@ -415,7 +505,11 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     // the same string to land in both fields and render duplicated.
     const hasGujaratiScript = (s: string): boolean => /[઀-૿]/.test(s);
 
-    const recordName = (rawIdentifier: string, language: string | undefined, name: string | undefined) => {
+    const recordName = (
+      rawIdentifier: string,
+      language: string | undefined,
+      name: string | undefined,
+    ) => {
       if (!rawIdentifier || !name) return;
       const cleaned = cleanName(name);
       if (!cleaned || isPlaceholderName(cleaned)) return;
@@ -423,11 +517,15 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       if (!base) return;
       if (!nameMap.has(base)) nameMap.set(base, {});
       const entry = nameMap.get(base)!;
-      const labelLang = String(language || 'English').toLowerCase();
+      const labelLang = String(language || "English").toLowerCase();
       const isGujaratiText = hasGujaratiScript(cleaned);
       // Script wins over label
-      const lang = isGujaratiText ? 'gujarati' : (labelLang === 'gujarati' ? 'english' : labelLang);
-      if (lang === 'gujarati') {
+      const lang = isGujaratiText
+        ? "gujarati"
+        : labelLang === "gujarati"
+          ? "english"
+          : labelLang;
+      if (lang === "gujarati") {
         if (!entry.gujaratiName) entry.gujaratiName = cleaned;
       } else {
         if (!entry.englishName) entry.englishName = cleaned;
@@ -435,9 +533,9 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     };
 
     const recordEnglish = (rawIdentifier: string, name: string | undefined) =>
-      recordName(rawIdentifier, 'English', name);
+      recordName(rawIdentifier, "English", name);
     const recordGujarati = (rawIdentifier: string, name: string | undefined) =>
-      recordName(rawIdentifier, 'Gujarati', name);
+      recordName(rawIdentifier, "Gujarati", name);
 
     // 1. Dashboard registry — highest priority (already resolves clean english/gujarati names)
     for (const row of registryRows) {
@@ -460,11 +558,17 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       recordName(sop.identifier, sop.language, sop.name);
     }
 
-    const lookupName = (base: string): { englishName: string; gujaratiName: string; isDualLanguage: boolean } => {
+    const lookupName = (
+      base: string,
+    ): {
+      englishName: string;
+      gujaratiName: string;
+      isDualLanguage: boolean;
+    } => {
       const upper = base.toUpperCase();
       const info = nameMap.get(upper) || {};
-      const englishName = info.englishName || '';
-      const gujaratiName = info.gujaratiName || '';
+      const englishName = info.englishName || "";
+      const gujaratiName = info.gujaratiName || "";
       return {
         englishName,
         gujaratiName,
@@ -483,7 +587,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
     // Helper to check if code/name is valid
     const isValidSopCode = (code: string): boolean => {
-      if (!code || code.trim() === '') return false;
+      if (!code || code.trim() === "") return false;
       const trimmed = code.trim();
       // Filter out placeholder/invalid entries (dashes, checkmarks, etc.)
       if (/^[-–—√✓✗×•·*]+$/.test(trimmed)) return false;
@@ -491,7 +595,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     };
 
     const isValidSopName = (name: string): boolean => {
-      if (!name || name.trim() === '') return false;
+      if (!name || name.trim() === "") return false;
       const trimmed = name.trim();
       // Filter out placeholder/invalid entries
       if (/^[-–—√✓✗×•·*]+$/.test(trimmed)) return false;
@@ -510,7 +614,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     // Add SOPs from aggregated training records (actual matrix data)
     // using grouped keys, which avoids a second full collection scan.
     for (const row of trainingAgg as Array<{ _id: { sopCode?: string } }>) {
-      const stripCode = stripVersion(String(row?._id?.sopCode || ''));
+      const stripCode = stripVersion(String(row?._id?.sopCode || ""));
       const sopName = resolveName(stripCode);
       if (isValidSopCode(stripCode) && isValidSopName(sopName)) {
         sopSet.set(stripCode, sopName);
@@ -577,11 +681,14 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       canonicalEntries = [];
       const seenBases = new Set<string>();
       for (const row of canonicalRows as any[]) {
-        const sopNo = String(row?.sopNo || row?.identifier || '').trim();
+        const sopNo = String(row?.sopNo || row?.identifier || "").trim();
         const code = stripVersion(sopNo);
         if (!code || seenBases.has(code)) continue;
         seenBases.add(code);
-        const sopName = resolveName(code, row?.englishName || row?.sopName || row?.name);
+        const sopName = resolveName(
+          code,
+          row?.englishName || row?.sopName || row?.name,
+        );
         if (!isValidSopCode(code) || !isValidSopName(sopName)) continue;
         canonicalEntries.push([code, sopName]);
       }
@@ -592,36 +699,49 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     // Apply search filter
     const filteredSOPs = canonicalEntries.filter(([code, name]) => {
       if (!search) return true;
-      return code.toLowerCase().includes(search) || name.toLowerCase().includes(search);
+      return (
+        code.toLowerCase().includes(search) ||
+        name.toLowerCase().includes(search)
+      );
     });
 
     // Build response rows
     const sops: SOPViewRow[] = filteredSOPs.map(([sopCode, sopName]) => {
-      const deptStats: SOPViewDeptStat[] = DEFAULT_DEPARTMENTS.map(dept => {
+      const deptStats: SOPViewDeptStat[] = DEFAULT_DEPARTMENTS.map((dept) => {
         const deptAssignmentsRaw = assignmentMap.get(sopCode)?.get(dept) || [];
         const deptAssignments = deptAssignmentsRaw
-          .flatMap(v => String(v || '').split(/[;,/|]/))
-          .map(v => v.trim())
+          .flatMap((v) => String(v || "").split(/[;,/|]/))
+          .map((v) => v.trim())
           .filter(Boolean);
         const isAssigned = deptAssignments.length > 0;
-        const assignedTokens = new Set(deptAssignments.map(normalizeDesignationToken));
-
-        const designationTraining = trainingMap.get(sopCode)?.get(dept) || new Map<string, Map<number, number>>();
-        const designations: SOPViewDesignationStat[] = Array.from(designationsByDept.get(dept) || new Set<string>()).map(
-          (designation: string): SOPViewDesignationStat => {
-            const monthCounts = designationTraining.get(designation) || new Map<number, number>();
-            const count: number = Array.from(monthCounts.values()).reduce((a: number, b: number) => a + b, 0);
-            const designationToken = normalizeDesignationToken(designation);
-            const designationAbbrToken = normalizeDesignationToken(desigAbbr(designation));
-            return {
-              designation,
-              isAssigned:
-                assignedTokens.has(designationToken) ||
-                assignedTokens.has(designationAbbrToken),
-              count
-            };
-          }
+        const assignedTokens = new Set(
+          deptAssignments.map(normalizeDesignationToken),
         );
+
+        const designationTraining =
+          trainingMap.get(sopCode)?.get(dept) ||
+          new Map<string, Map<number, number>>();
+        const designations: SOPViewDesignationStat[] = Array.from(
+          designationsByDept.get(dept) || new Set<string>(),
+        ).map((designation: string): SOPViewDesignationStat => {
+          const monthCounts =
+            designationTraining.get(designation) || new Map<number, number>();
+          const count: number = Array.from(monthCounts.values()).reduce(
+            (a: number, b: number) => a + b,
+            0,
+          );
+          const designationToken = normalizeDesignationToken(designation);
+          const designationAbbrToken = normalizeDesignationToken(
+            desigAbbr(designation),
+          );
+          return {
+            designation,
+            isAssigned:
+              assignedTokens.has(designationToken) ||
+              assignedTokens.has(designationAbbrToken),
+            count,
+          };
+        });
 
         const monthlyCounts: Record<number, number> = {};
         for (let m = 1; m <= 12; m++) {
@@ -660,25 +780,29 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
           monthlyCounts,
           total,
           scheduledMonth,
-          isScheduled
+          isScheduled,
         };
       });
 
       const grandTotal = deptStats.reduce((sum, ds) => sum + ds.total, 0);
       const nameInfo = lookupName(sopCode);
       // Always prefer the resolved english name; fall back to whatever resolveName returned (already cleaned).
-      const finalEnglish = nameInfo.englishName || cleanName(sopName) || sopCode;
+      const finalEnglish =
+        nameInfo.englishName || cleanName(sopName) || sopCode;
       // Only attach gujarati when we have a real english name + a real gujarati name (no gujarati-only rows).
-      const gujarati = nameInfo.englishName && nameInfo.gujaratiName ? nameInfo.gujaratiName : undefined;
+      const gujarati =
+        nameInfo.englishName && nameInfo.gujaratiName
+          ? nameInfo.gujaratiName
+          : undefined;
 
       // Primary department: from MasterSOPRepository / SOPLibrary if known,
       // otherwise from assignments — the dept with the most assigned designations.
-      let primaryDepartment = primaryDeptMap.get(sopCode.toUpperCase()) || '';
+      let primaryDepartment = primaryDeptMap.get(sopCode.toUpperCase()) || "";
       if (!primaryDepartment) {
-        let bestDept = '';
+        let bestDept = "";
         let bestScore = -1;
         for (const ds of deptStats) {
-          const score = ds.designations.filter(d => d.isAssigned).length;
+          const score = ds.designations.filter((d) => d.isAssigned).length;
           if (score > bestScore) {
             bestScore = score;
             bestDept = ds.department;
@@ -704,10 +828,44 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     //   • perDept[d].excelDeptSplit.unknownMissing → unknown-owner red counts
     //   • perDept[d].missingFromExcelList         → the actual codes those reds represent
     // The Manage SOP page just mirrors these.
-    const overviewDbSopCount = (overviewCached as { totalCard?: { dbSopCount?: number } } | null)?.totalCard
-      ?.dbSopCount;
+    // If the overview cache is cold, hydrate once from the overview API route so
+    // Manage SOP cards/filters stay aligned with Training Matrix.
+    let overviewData: any = overviewCached || null;
+    if (!overviewData) {
+      try {
+        const overviewRes = await fetch(
+          `${request.nextUrl.origin}/api/training-matrix/overview?refresh=1`,
+          { cache: "no-store" },
+        );
+        if (overviewRes.ok) overviewData = await overviewRes.json();
+      } catch {
+        // Non-fatal; we'll still derive fallbacks below.
+      }
+    }
+
+    // Rebuild dbSop universe from overview payload when cache did not provide it.
+    if (overviewDbSopCodes.size === 0) {
+      const dbSopsByDept =
+        (overviewData as {
+          totalCard?: {
+            dbSopsByDept?: Record<string, Array<{ sopCode?: string; title?: string }>>;
+          };
+        } | null)?.totalCard?.dbSopsByDept || {};
+      for (const list of Object.values(dbSopsByDept)) {
+        if (!Array.isArray(list)) continue;
+        for (const item of list) {
+          const base = stripVersion(String(item?.sopCode || ""));
+          if (!base || overviewDbSopCodes.has(base)) continue;
+          overviewDbSopCodes.set(base, String(item?.title || "").trim());
+        }
+      }
+    }
+
+    const overviewDbSopCount = (
+      overviewData as { totalCard?: { dbSopCount?: number } } | null
+    )?.totalCard?.dbSopCount;
     const totalSOPs =
-      typeof overviewDbSopCount === 'number' && overviewDbSopCount > 0
+      typeof overviewDbSopCount === "number" && overviewDbSopCount > 0
         ? overviewDbSopCount
         : overviewDbSopCodes.size > 0
           ? overviewDbSopCodes.size
@@ -717,18 +875,23 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     let overviewUnassignedCount = 0;
     const unassignedSopCodes = new Set<string>();
     try {
-      const overviewJson = (overviewCached || null) as { perDept?: Record<string, any> } | null;
+      const overviewJson = (overviewData || null) as {
+        perDept?: Record<string, any>;
+      } | null;
       const perDept = overviewJson?.perDept || {};
       for (const dept of Object.keys(perDept)) {
         const pd = perDept[dept];
         if (!pd?.uploaded) continue;
         const split = pd.excelDeptSplit || {};
         const missingByDept = split.missingByDept || {};
-        for (const v of Object.values(missingByDept)) overviewUnassignedCount += Number(v) || 0;
+        for (const v of Object.values(missingByDept))
+          overviewUnassignedCount += Number(v) || 0;
         overviewUnassignedCount += Number(split.unknownMissing) || 0;
-        const list = Array.isArray(pd.missingFromExcelList) ? pd.missingFromExcelList : [];
+        const list = Array.isArray(pd.missingFromExcelList)
+          ? pd.missingFromExcelList
+          : [];
         for (const item of list) {
-          const code = stripVersion(String(item?.sopCode || '')).toUpperCase();
+          const code = stripVersion(String(item?.sopCode || "")).toUpperCase();
           if (code) unassignedSopCodes.add(code);
         }
       }
@@ -736,7 +899,9 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       // Overview unavailable — fall back to 0 rather than diverging numbers.
       overviewUnassignedCount = 0;
     }
-    const unassignedSOPs = overviewUnassignedCount;
+    // Prefer the actual missing-code list size (same set the filter uses).
+    const unassignedSOPs =
+      unassignedSopCodes.size > 0 ? unassignedSopCodes.size : overviewUnassignedCount;
 
     // Convert designationsByDept to plain object
     const designationsByDeptObj: Record<string, string[]> = {};
@@ -745,19 +910,27 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     }
 
     // Convert employeeCountsByDeptDesig to plain object
-    const employeeCountsByDeptDesigObj: Record<string, Record<string, number>> = {};
+    const employeeCountsByDeptDesigObj: Record<
+      string,
+      Record<string, number>
+    > = {};
     for (const [dept, dMap] of empCountMap) {
       employeeCountsByDeptDesigObj[dept] = Object.fromEntries(dMap);
     }
 
-    const employeesByDeptObj: Record<string, Array<{ name: string; designation: string }>> = {};
+    const employeesByDeptObj: Record<
+      string,
+      Array<{ name: string; designation: string }>
+    > = {};
     for (const [dept, list] of empRoster) {
       employeesByDeptObj[dept] = list;
     }
 
     // Custom department order: QA → QC → Microbiology → Production → Store → Engineering → Personnel.
     // Within each department, sort by sopCode. SOPs with no resolvable primary dept go last.
-    const deptOrder = new Map<string, number>(DEFAULT_DEPARTMENTS.map((d, i) => [d, i]));
+    const deptOrder = new Map<string, number>(
+      DEFAULT_DEPARTMENTS.map((d, i) => [d, i]),
+    );
     const deptRank = (sop: SOPViewRow): number => {
       // Prefer the SOP's registry-based primary department; otherwise the first dept it counts for.
       if (sop.primaryDepartment && deptOrder.has(sop.primaryDepartment)) {
@@ -793,7 +966,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       if (!sched) continue;
       for (const [, monthNum] of sched) {
         if (!monthNum) continue;
-        sopCountsByDeptMonth[dept][monthNum] = (sopCountsByDeptMonth[dept][monthNum] || 0) + 1;
+        sopCountsByDeptMonth[dept][monthNum] =
+          (sopCountsByDeptMonth[dept][monthNum] || 0) + 1;
         sopCountsByDept[dept] = (sopCountsByDept[dept] || 0) + 1;
       }
     }
@@ -817,7 +991,10 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     }
 
     // Assigned = sum of all (sop, dept) scheduled entries = sum of dept totals (e.g. 702)
-    const assignedCount = Object.values(sopCountsByDept).reduce((a, b) => a + b, 0);
+    const assignedCount = Object.values(sopCountsByDept).reduce(
+      (a, b) => a + b,
+      0,
+    );
 
     // Build manual-allocation map from records inserted via the Manage SOP page.
     // Key by the SAME base sop code the UI uses (stripVersion + uppercase).
@@ -829,10 +1006,10 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       month?: number;
       designation?: string;
     }>) {
-      const code = stripVersion(String(r.sopCode || '')).toUpperCase();
+      const code = stripVersion(String(r.sopCode || "")).toUpperCase();
       const dept = r.department;
       const month = r.month;
-      const designation = (r.designation || '').trim();
+      const designation = (r.designation || "").trim();
       if (!code || !dept || !Number.isInteger(month)) continue;
       if (!manualAllocations[code]) manualAllocations[code] = {};
       if (!manualAllocations[code][dept]) manualAllocations[code][dept] = [];
@@ -841,7 +1018,8 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       }
       if (designation) {
         if (!manualDesigSets[code]) manualDesigSets[code] = {};
-        if (!manualDesigSets[code][dept]) manualDesigSets[code][dept] = new Set();
+        if (!manualDesigSets[code][dept])
+          manualDesigSets[code][dept] = new Set();
         manualDesigSets[code][dept].add(designation);
       }
     }
@@ -868,7 +1046,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       stats: {
         total: totalSOPs,
         assigned: assignedCount,
-        unassigned: unassignedSOPs
+        unassigned: unassignedSOPs,
       },
       sopCountsByDeptMonth,
       sopCountsByMonth,
@@ -876,7 +1054,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       unassignedSopCodes: Array.from(unassignedSopCodes),
       manualAllocations,
       manualDesignations,
-      year: yearAll ? 'all' : year
+      year: yearAll ? "all" : year,
     };
     const responseBuildMs = elapsedMs(responseBuildStartMs);
 
@@ -885,7 +1063,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
     const cacheStoreMs = elapsedMs(cacheStoreStartMs);
 
     console.info(
-      `${MANAGE_SOP_API_LOG} GET /api/training-matrix/manage-sop-view source=manage-sop cache=MISS year=${cacheYear} search="${search}" dbConnectMs=${dbConnectMs} dataFetchMs=${dataFetchMs} buildMs=${responseBuildMs} cacheStoreMs=${cacheStoreMs} dashboardCache=${dashboardCached ? 'HIT' : 'MISS'} overviewCache=${overviewCached ? 'HIT' : 'MISS'} totalMs=${elapsedMs(reqStartMs)}`,
+      `${MANAGE_SOP_API_LOG} GET /api/training-matrix/manage-sop-view source=manage-sop cache=MISS year=${cacheYear} search="${search}" dbConnectMs=${dbConnectMs} dataFetchMs=${dataFetchMs} buildMs=${responseBuildMs} cacheStoreMs=${cacheStoreMs} dashboardCache=${dashboardCached ? "HIT" : "MISS"} overviewCache=${overviewCached ? "HIT" : "MISS"} totalMs=${elapsedMs(reqStartMs)}`,
     );
 
     return NextResponse.json(response, { status: 200 });
@@ -894,7 +1072,10 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       `${MANAGE_SOP_API_LOG} GET /api/training-matrix/manage-sop-view source=manage-sop FAILED totalMs=${elapsedMs(reqStartMs)}`,
       error,
     );
-    return NextResponse.json({ error: 'Failed to fetch SOP view data' }, { status: 500 });
+    return NextResponse.json(
+      { error: "Failed to fetch SOP view data" },
+      { status: 500 },
+    );
   }
 }
 
@@ -932,21 +1113,21 @@ export interface ManageSOPApplyRequest {
 async function getOrCreateManualUploadId(
   dept: string,
   year: number,
-  month: number
+  month: number,
 ): Promise<any> {
   const filter = {
     department: dept,
     year,
     month,
-    fileType: 'addendum' as const,
-    fileName: 'manage-sop-manual',
+    fileType: "addendum" as const,
+    fileName: "manage-sop-manual",
   };
   const existing = await TrainingMatrixUpload.findOne(filter).lean();
   if (existing && (existing as any)._id) return (existing as any)._id;
   const created = await TrainingMatrixUpload.create({
     ...filter,
     monthName: MONTH_NAMES[month] || `Month ${month}`,
-    uploadedBy: 'manage-sop',
+    uploadedBy: "manage-sop",
   });
   return created._id;
 }
@@ -964,7 +1145,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       console.info(
         `${MANAGE_SOP_API_LOG} POST /api/training-matrix/manage-sop-view source=manage-sop empty_payload dbConnectMs=${dbConnectMs} totalMs=${elapsedMs(reqStartMs)}`,
       );
-      return NextResponse.json({ error: 'No changes provided' }, { status: 400 });
+      return NextResponse.json(
+        { error: "No changes provided" },
+        { status: 400 },
+      );
     }
 
     const fallbackYear = new Date().getFullYear();
@@ -975,12 +1159,19 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const warnings: string[] = [];
 
     for (const removal of removalEntries) {
-      const sopCode = (removal.sopCode || '').trim();
-      const department = (removal.department || '').trim();
-      const months = (removal.months || []).filter(m => Number.isInteger(m) && m >= 1 && m <= 12);
-      const designations = (removal.designations || []).map(d => (d || '').trim()).filter(Boolean);
+      const sopCode = (removal.sopCode || "").trim();
+      const department = (removal.department || "").trim();
+      const months = (removal.months || []).filter(
+        (m) => Number.isInteger(m) && m >= 1 && m <= 12,
+      );
+      const designations = (removal.designations || [])
+        .map((d) => (d || "").trim())
+        .filter(Boolean);
       const removeAllDesignations = removal.removeAllDesignations === true;
-      const year = removal.year && Number.isInteger(removal.year) ? removal.year : fallbackYear;
+      const year =
+        removal.year && Number.isInteger(removal.year)
+          ? removal.year
+          : fallbackYear;
 
       if (!sopCode || !department || months.length === 0) continue;
       if (!removeAllDesignations && designations.length === 0) continue;
@@ -990,7 +1181,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         department,
         year,
         month: { $in: months },
-        sourceFile: 'manage-sop-manual',
+        sourceFile: "manage-sop-manual",
       };
       if (!removeAllDesignations) {
         filter.designation = { $in: designations };
@@ -1001,13 +1192,23 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     for (const entry of upsertEntries) {
-      const sopCode = (entry.sopCode || '').trim();
-      const department = (entry.department || '').trim();
-      const designations = (entry.designations || []).map(d => (d || '').trim()).filter(Boolean);
-      const months = (entry.months || []).filter(m => Number.isInteger(m) && m >= 1 && m <= 12);
-      const year = entry.year && Number.isInteger(entry.year) ? entry.year : fallbackYear;
+      const sopCode = (entry.sopCode || "").trim();
+      const department = (entry.department || "").trim();
+      const designations = (entry.designations || [])
+        .map((d) => (d || "").trim())
+        .filter(Boolean);
+      const months = (entry.months || []).filter(
+        (m) => Number.isInteger(m) && m >= 1 && m <= 12,
+      );
+      const year =
+        entry.year && Number.isInteger(entry.year) ? entry.year : fallbackYear;
 
-      if (!sopCode || !department || designations.length === 0 || months.length === 0) {
+      if (
+        !sopCode ||
+        !department ||
+        designations.length === 0 ||
+        months.length === 0
+      ) {
         continue;
       }
 
@@ -1017,11 +1218,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         department,
         designation: { $in: designations },
       })
-        .select('name designation')
+        .select("name designation")
         .lean();
 
       if (employees.length === 0) {
-        warnings.push(`No active employees found in ${department} for designations: ${designations.join(', ')}`);
+        warnings.push(
+          `No active employees found in ${department} for designations: ${designations.join(", ")}`,
+        );
         continue;
       }
 
@@ -1036,8 +1239,8 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         }
         const monthName = MONTH_NAMES[month] || `Month ${month}`;
         for (const emp of employees as any[]) {
-          const employeeName = String(emp.name || '').trim();
-          const designation = String(emp.designation || '').trim();
+          const employeeName = String(emp.name || "").trim();
+          const designation = String(emp.designation || "").trim();
           if (!employeeName) continue;
           ops.push({
             updateOne: {
@@ -1053,13 +1256,13 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
                   month,
                   year,
                   monthName,
-                  rawSymbol: '✓',
-                  sourceFile: 'manage-sop-manual',
+                  rawSymbol: "✓",
+                  sourceFile: "manage-sop-manual",
                   isAddendum: true,
                 },
                 // Always normalize status to 'completed' on apply — the user is asserting
                 // these trainings happened.
-                $set: { status: 'completed' },
+                $set: { status: "completed" },
               },
               upsert: true,
             },
@@ -1068,7 +1271,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       }
 
       if (ops.length === 0) continue;
-      const result = await TrainingMatrixRecord.bulkWrite(ops, { ordered: false });
+      const result = await TrainingMatrixRecord.bulkWrite(ops, {
+        ordered: false,
+      });
       const inserted = (result as any).upsertedCount || 0;
       const matched = (result as any).matchedCount || 0;
       const modified = (result as any).modifiedCount || 0;
@@ -1085,44 +1290,57 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       try {
         const mainUpload: any = await TrainingMatrixUpload.findOne({
           department,
-          fileType: 'main',
+          fileType: "main",
           snapshot: { $exists: true, $ne: null },
         })
           .sort({ uploadedAt: -1 })
           .lean();
         if (mainUpload?._id) {
-          const snapshotCodes: string[] = Array.isArray(mainUpload?.snapshot?.sopCodes)
+          const snapshotCodes: string[] = Array.isArray(
+            mainUpload?.snapshot?.sopCodes,
+          )
             ? mainUpload.snapshot.sopCodes
             : [];
           const base = stripVersion(sopCode);
-          const alreadyInCodes = snapshotCodes.some(c => stripVersion(String(c)) === base);
+          const alreadyInCodes = snapshotCodes.some(
+            (c) => stripVersion(String(c)) === base,
+          );
           const firstMonth = months[0];
           const monthName = MONTH_NAMES[firstMonth] || `Month ${firstMonth}`;
           const update: any = {
             $set: { [`snapshot.sopMonthMap.${sopCode}`]: monthName },
           };
           if (!alreadyInCodes) {
-            update.$addToSet = { 'snapshot.sopCodes': sopCode };
+            update.$addToSet = { "snapshot.sopCodes": sopCode };
           }
 
           // Mark the SOP as completed in the per-employee training map so the
           // Training Matrix employee × SOP detail grid (rendered from
           // snapshot.employees[].training) also reflects the new assignment.
-          const snapshotEmployees: Array<{ name?: string; designation?: string; training?: Record<string, boolean> }> =
-            Array.isArray(mainUpload?.snapshot?.employees) ? mainUpload.snapshot.employees : [];
-          const desigSet = new Set(designations.map(d => d.toLowerCase()));
+          const snapshotEmployees: Array<{
+            name?: string;
+            designation?: string;
+            training?: Record<string, boolean>;
+          }> = Array.isArray(mainUpload?.snapshot?.employees)
+            ? mainUpload.snapshot.employees
+            : [];
+          const desigSet = new Set(designations.map((d) => d.toLowerCase()));
           snapshotEmployees.forEach((emp, idx) => {
-            const desig = String(emp?.designation || '').toLowerCase();
+            const desig = String(emp?.designation || "").toLowerCase();
             if (!desigSet.has(desig)) return;
             update.$set[`snapshot.employees.${idx}.training.${sopCode}`] = true;
           });
 
           await TrainingMatrixUpload.updateOne({ _id: mainUpload._id }, update);
         } else {
-          warnings.push(`No main Training Matrix upload found for ${department} — count cards will not refresh until an Excel is uploaded for this dept.`);
+          warnings.push(
+            `No main Training Matrix upload found for ${department} — count cards will not refresh until an Excel is uploaded for this dept.`,
+          );
         }
       } catch (e) {
-        warnings.push(`Failed to sync ${department} snapshot for ${sopCode}: ${(e as Error).message}`);
+        warnings.push(
+          `Failed to sync ${department} snapshot for ${sopCode}: ${(e as Error).message}`,
+        );
       }
     }
 
@@ -1149,7 +1367,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         unchanged: totalUnchanged,
         warnings,
       },
-      { status: 200 }
+      { status: 200 },
     );
   } catch (error) {
     console.error(
@@ -1157,8 +1375,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       error,
     );
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to apply changes' },
-      { status: 500 }
+      {
+        error:
+          error instanceof Error ? error.message : "Failed to apply changes",
+      },
+      { status: 500 },
     );
   }
 }

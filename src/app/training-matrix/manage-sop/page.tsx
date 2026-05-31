@@ -134,7 +134,7 @@ interface ManageSOPViewResponse {
   year: number | 'all';
 }
 
-const MANAGE_SOP_VIEW_LOCAL_CACHE_KEY = 'manage_sop_view_cache_v2';
+const MANAGE_SOP_VIEW_LOCAL_CACHE_KEY = 'manage_sop_view_cache_v3';
 
 function readManageSopLocalCache(): ManageSOPViewResponse | null {
   try {
@@ -374,6 +374,13 @@ export default function ManageSOPDashboard() {
   } | null>(null);
   const [empModalSearch, setEmpModalSearch] = useState('');
   const [empModalFilter, setEmpModalFilter] = useState<EmpFilter>('all');
+  const [addEmpModal, setAddEmpModal] = useState<{
+    sopCode: string;
+    sopName: string;
+    dept: string;
+  } | null>(null);
+  const [addEmpSearch, setAddEmpSearch] = useState('');
+  const [addEmpSelected, setAddEmpSelected] = useState<Record<string, boolean>>({});
 
   const stripCodeVersion = useCallback((code: string) => code.split('-').shift() || code, []);
 
@@ -416,6 +423,65 @@ export default function ManageSOPDashboard() {
       );
     }
   }, [overviewCache, stripCodeVersion]);
+
+  const openAddEmployeeModal = useCallback((sopCode: string, sopName: string, dept: string) => {
+    setAddEmpModal({ sopCode, sopName, dept });
+    setAddEmpSearch('');
+    setAddEmpSelected({});
+  }, []);
+
+  const addEmpCandidates = useMemo(() => {
+    if (!addEmpModal || !viewData) return [];
+    const q = addEmpSearch.trim().toLowerCase();
+    const list = viewData.employeesByDept?.[addEmpModal.dept] || [];
+    return list.filter((emp) => {
+      if (!q) return true;
+      return (
+        String(emp.name || '').toLowerCase().includes(q) ||
+        String(emp.designation || '').toLowerCase().includes(q)
+      );
+    });
+  }, [addEmpModal, addEmpSearch, viewData]);
+
+  const applyAddEmployees = useCallback(() => {
+    if (!addEmpModal || !viewData) return;
+    const selected = addEmpCandidates.filter((emp, idx) => {
+      const key = `${emp.name}__${emp.designation}__${idx}`;
+      return !!addEmpSelected[key];
+    });
+    if (selected.length === 0) {
+      setAddEmpModal(null);
+      return;
+    }
+
+    for (const emp of selected) {
+      const desig = String(emp.designation || '').trim();
+      if (!desig) continue;
+      setDesigChecked(addEmpModal.sopCode, addEmpModal.dept, desig, true);
+    }
+
+    const sop = viewData.sops.find((s) => s.sopCode === addEmpModal.sopCode);
+    const deptStat = sop?.deptStats.find((d) => d.department === addEmpModal.dept);
+    const manualMonths =
+      viewData.manualAllocations?.[addEmpModal.sopCode.toUpperCase()]?.[addEmpModal.dept] || [];
+    const sopMonth = monthCells[addEmpModal.sopCode] || EMPTY_INNER;
+    let hasSelectedMonth = false;
+    for (let m = 1; m <= 12; m++) {
+      const key = cellInnerKey(addEmpModal.dept, m);
+      const persisted = manualMonths.includes(m) || deptStat?.scheduledMonth === m;
+      const selected = key in sopMonth ? !!sopMonth[key] : persisted;
+      if (selected) {
+        hasSelectedMonth = true;
+        break;
+      }
+    }
+    if (!hasSelectedMonth) {
+      const fallbackMonth = deptStat?.scheduledMonth || (new Date().getMonth() + 1);
+      toggleMonthCell(addEmpModal.sopCode, addEmpModal.dept, fallbackMonth, true);
+    }
+
+    setAddEmpModal(null);
+  }, [addEmpModal, addEmpCandidates, addEmpSelected, viewData, monthCells, EMPTY_INNER, setDesigChecked, toggleMonthCell]);
 
   const empModalDerived = useMemo(() => {
     if (!empModal) return null;
@@ -691,7 +757,7 @@ export default function ManageSOPDashboard() {
         // If we already have cached data, keep UI interactive while refreshing.
         if (!viewData) setLoading(true);
         // year=all → match the source-of-truth main training matrix (no year scoping)
-        const res = await fetch(`/api/training-matrix/manage-sop-view?year=all`, { cache: 'no-store' });
+        const res = await fetch(`/api/training-matrix/manage-sop-view?year=all&refresh=1`, { cache: 'no-store' });
         if (!res.ok) throw new Error('Failed to fetch');
         const data: ManageSOPViewResponse = await res.json();
         setViewData(data);
@@ -730,6 +796,7 @@ export default function ManageSOPDashboard() {
     const q = deferredSearch.toLowerCase();
     const primaryDeptCache = new Map<string, string>();
     const designationCountCache = new Map<string, number>();
+    const norm = (v: unknown) => String(v || '').trim().toLowerCase();
     const primaryDeptForSort = (sop: ManageSOPViewResponse['sops'][0]): string => {
       const cacheKey = sop.sopCode || '';
       if (primaryDeptCache.has(cacheKey)) return primaryDeptCache.get(cacheKey)!;
@@ -763,7 +830,49 @@ export default function ManageSOPDashboard() {
       if (cardFilter === 'assigned' && unassignedSet.has(code.toUpperCase())) return false;
 
       if (q) {
-        return code.toLowerCase().includes(q) || name.toLowerCase().includes(q);
+        const textMatch =
+          code.toLowerCase().includes(q) || name.toLowerCase().includes(q);
+        if (textMatch) return true;
+
+        // Employee-name search should match only when that employee is actually
+        // allocated (training checked + at least one selected month in that dept).
+        const sopOverrides = overrides[sop.sopCode] || EMPTY_INNER;
+        const sopMonth = monthCells[sop.sopCode] || EMPTY_INNER;
+        const sopManual = viewData.manualAllocations?.[sop.sopCode.toUpperCase()] || EMPTY_MANUAL;
+        const sopManualDesigs =
+          viewData.manualDesignations?.[sop.sopCode.toUpperCase()] || EMPTY_MANUAL_DESIG;
+        const employeesByDept = viewData.employeesByDept || EMPTY_EMP_BY_DEPT;
+
+        for (const dept of viewData.departments || []) {
+          const deptStat = sop.deptStats.find(s => s.department === dept);
+          const manualMonths = sopManual[dept] || [];
+          let hasSelectedMonth = false;
+          for (let m = 1; m <= 12; m++) {
+            const key = cellInnerKey(dept, m);
+            const persisted = manualMonths.includes(m) || deptStat?.scheduledMonth === m;
+            const selected = key in sopMonth ? !!sopMonth[key] : persisted;
+            if (selected) { hasSelectedMonth = true; break; }
+          }
+          if (!hasSelectedMonth) continue;
+
+          const selectedDesigs = new Set(
+            allDesignationsRef.current.filter((fullName) => {
+              const key = desigKey(dept, fullName);
+              if (key in sopOverrides) return !!sopOverrides[key];
+              return (deptStat?.designations || []).some(
+                (d) => d.designation === fullName && (d.isAssigned || (d.count || 0) > 0),
+              ) || (sopManualDesigs[dept] || []).some((d) => d === fullName);
+            }).map(norm),
+          );
+
+          if (selectedDesigs.size === 0) continue;
+          const emps = employeesByDept[dept] || [];
+          const hasEmpMatch = emps.some((emp) =>
+            norm(emp.name).includes(q) && selectedDesigs.has(norm(emp.designation)),
+          );
+          if (hasEmpMatch) return true;
+        }
+        return false;
       }
       return true;
     });
@@ -814,7 +923,7 @@ export default function ManageSOPDashboard() {
     };
 
     return sortKey === 'sr' ? base : [...base].sort(cmp);
-  }, [viewData, deferredSearch, sortKey, sortDir, cardFilter, unassignedSet]);
+  }, [viewData, deferredSearch, sortKey, sortDir, cardFilter, unassignedSet, overrides, monthCells, EMPTY_INNER, EMPTY_MANUAL, EMPTY_MANUAL_DESIG, EMPTY_EMP_BY_DEPT]);
 
   // Per-SOP per-dept "counts toward this department" predicate.
   // True if the SOP is scheduled for the dept, OR assigned to the dept, OR if the dept
@@ -850,7 +959,9 @@ export default function ManageSOPDashboard() {
       if (!sop.deptStats.some(ds => ds.scheduledMonth)) wasUnassigned.add(sop.sopCode);
     }
 
-    for (const [sopCode, inner] of Object.entries(monthCells)) {
+    // Only applied (committed) month selections affect global counts/cards.
+    // This prevents unrelated numbers from changing while the user is still editing.
+    for (const [sopCode, inner] of Object.entries(appliedMonthCells)) {
       const sop = viewData.sops.find(s => s.sopCode === sopCode);
       if (!sop) continue;
       let anyAdded = false;
@@ -880,11 +991,12 @@ export default function ManageSOPDashboard() {
       }
     }
     return { byDeptMonth, byDept, byMonth, sopsNewlyAssigned, sopsNewlyUnassigned };
-  }, [monthCells, viewData]);
+  }, [appliedMonthCells, viewData]);
 
   const countsAPI: CountsAPI = useMemo(() => {
     const baseAssigned = viewData?.stats.assigned ?? 0;
-    const baseUnassigned = viewData?.stats.unassigned ?? 0;
+    const baseUnassigned =
+      viewData?.unassignedSopCodes?.length ?? (viewData?.stats.unassigned ?? 0);
     const baseTotal = viewData?.stats.total ?? 0;
     const deltaAssigned = Object.values(deltas.byDept).reduce((a, b) => a + b, 0);
     return {
@@ -1153,51 +1265,8 @@ export default function ManageSOPDashboard() {
   const [scrollWidth, setScrollWidth] = useState(0);
   const syncing = useRef<'main' | 'proxy' | null>(null);
 
-  // Virtualize SOP rows — hooks must run before any conditional return.
-  const ROW_HEIGHT_PX = 80;
-  const OVERSCAN_ROWS = 8;
-  const [rowWindow, setRowWindow] = useState<{ start: number; end: number }>({ start: 0, end: 60 });
-
-  useEffect(() => {
-    let raf = 0;
-    const update = () => {
-      const el = tableScrollRef.current;
-      if (!el) return;
-      const rect = el.getBoundingClientRect();
-      const topY = rect.top + window.scrollY;
-      const scrollY = window.scrollY;
-      const viewportH = window.innerHeight || 800;
-
-      const visibleTop = Math.max(0, scrollY - topY);
-      const start = Math.max(0, Math.floor(visibleTop / ROW_HEIGHT_PX) - OVERSCAN_ROWS);
-      const end = Math.min(
-        filteredSops.length,
-        Math.ceil((visibleTop + viewportH) / ROW_HEIGHT_PX) + OVERSCAN_ROWS
-      );
-      setRowWindow(prev => (prev.start === start && prev.end === end ? prev : { start, end }));
-    };
-
-    const onScrollOrResize = () => {
-      if (raf) cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(update);
-    };
-
-    update();
-    window.addEventListener('scroll', onScrollOrResize, { passive: true });
-    window.addEventListener('resize', onScrollOrResize);
-    return () => {
-      if (raf) cancelAnimationFrame(raf);
-      window.removeEventListener('scroll', onScrollOrResize);
-      window.removeEventListener('resize', onScrollOrResize);
-    };
-  }, [filteredSops.length]);
-
-  const windowedSops = useMemo(
-    () => filteredSops.slice(rowWindow.start, rowWindow.end),
-    [filteredSops, rowWindow.start, rowWindow.end]
-  );
-  const topSpacerPx = rowWindow.start * ROW_HEIGHT_PX;
-  const bottomSpacerPx = Math.max(0, (filteredSops.length - rowWindow.end) * ROW_HEIGHT_PX);
+  // Use stable full rendering in this table to avoid spacer-height thrash while scrolling.
+  const windowedSops = filteredSops;
 
   useLayoutEffect(() => {
     const el = tableScrollRef.current;
@@ -1253,7 +1322,7 @@ export default function ManageSOPDashboard() {
   const departments = viewData.departments || [];
 
   return (
-    <div className="min-h-screen bg-gray-50 overflow-x-hidden">
+    <div className="h-screen flex flex-col bg-gray-50 overflow-hidden">
       {/* Header */}
       <div className="bg-white border-b border-gray-200 sticky top-0 z-50 shadow-sm">
         <div className="max-w-full mx-auto px-6 py-4">
@@ -1389,7 +1458,7 @@ export default function ManageSOPDashboard() {
       <div
         ref={tableScrollRef}
         onScroll={onMainScroll}
-        className="flex-1 overflow-x-auto"
+        className="flex-1 overflow-auto overscroll-contain"
         style={{ paddingBottom: 48 }}
       >
         <div className="inline-block min-w-full p-6">
@@ -1424,19 +1493,14 @@ export default function ManageSOPDashboard() {
                   </tr>
                 ) : (
                   <>
-                    {topSpacerPx > 0 ? (
-                      <tr aria-hidden="true">
-                        <td colSpan={6} style={{ height: topSpacerPx, padding: 0, border: 0 }} />
-                      </tr>
-                    ) : null}
-
                     {windowedSops.map((sop, localIdx) => {
-                      const idx = rowWindow.start + localIdx;
+                      const idx = localIdx;
                       return (
                     <SopRow
                       key={`sop-${sop.sopCode}`}
                       sop={sop}
                       idx={idx}
+                      isUnassigned={unassignedSet.has(String(sop.sopCode || '').toUpperCase())}
                       departments={departments}
                       designationsByDept={viewData.designationsByDept || {}}
                       allDesignations={allDesignationsRef.current}
@@ -1453,6 +1517,7 @@ export default function ManageSOPDashboard() {
                       viewMode={viewMode}
                       employeesByDept={viewData.employeesByDept || EMPTY_EMP_BY_DEPT}
                       onEmployeeClick={openEmployeeModal}
+                      onOpenAddEmployee={openAddEmployeeModal}
                       setDesigChecked={setDesigChecked}
                       setInductionChecked={setInductionChecked}
                       setDeptChecked={setDeptChecked}
@@ -1462,12 +1527,6 @@ export default function ManageSOPDashboard() {
                     />
                       );
                     })}
-
-                    {bottomSpacerPx > 0 ? (
-                      <tr aria-hidden="true">
-                        <td colSpan={6} style={{ height: bottomSpacerPx, padding: 0, border: 0 }} />
-                      </tr>
-                    ) : null}
                   </>
                 )}
               </tbody>
@@ -1692,6 +1751,96 @@ export default function ManageSOPDashboard() {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Add Employee modal — quick allocation helper for a specific SOP + department */}
+      {addEmpModal && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4"
+          onClick={() => setAddEmpModal(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-lg shadow-2xl flex flex-col w-full max-w-2xl"
+            style={{ maxHeight: '80vh' }}
+          >
+            <div className="flex items-start justify-between px-5 py-3 border-b border-gray-200 bg-gray-50 rounded-t-lg">
+              <div className="min-w-0">
+                <div className="text-base font-bold text-gray-900">Add Employee Allocation</div>
+                <div className="text-xs text-gray-600">
+                  {addEmpModal.sopCode} · {DEPT_ABBR[addEmpModal.dept] || addEmpModal.dept}
+                </div>
+              </div>
+              <button
+                onClick={() => setAddEmpModal(null)}
+                className="text-gray-400 hover:text-gray-700 text-2xl leading-none p-1"
+                aria-label="Close"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="px-5 py-3 border-b border-gray-200 bg-white">
+              <div className="relative">
+                <Search className="absolute left-3 top-2.5 text-gray-400 w-4 h-4" />
+                <input
+                  type="text"
+                  value={addEmpSearch}
+                  onChange={(e) => setAddEmpSearch(e.target.value)}
+                  placeholder="Search employee name or designation..."
+                  className="w-full pl-10 pr-3 py-2 border border-gray-300 rounded text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-auto px-5 py-3 space-y-2">
+              {addEmpCandidates.length === 0 ? (
+                <div className="text-sm text-gray-500">No employees found.</div>
+              ) : (
+                addEmpCandidates.map((emp, idx) => {
+                  const key = `${emp.name}__${emp.designation}__${idx}`;
+                  const checked = !!addEmpSelected[key];
+                  return (
+                    <label
+                      key={key}
+                      className="flex items-center justify-between gap-3 rounded border border-gray-200 px-3 py-2 hover:bg-gray-50 cursor-pointer"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-gray-900 truncate">{emp.name}</div>
+                        <div className="text-xs text-gray-500 truncate">{emp.designation}</div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(e) =>
+                          setAddEmpSelected((prev) => ({ ...prev, [key]: e.target.checked }))
+                        }
+                        className="w-4 h-4"
+                      />
+                    </label>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="px-5 py-3 border-t border-gray-200 bg-gray-50 flex items-center justify-end gap-2 rounded-b-lg">
+              <button
+                type="button"
+                onClick={() => setAddEmpModal(null)}
+                className="px-3 py-1.5 rounded border border-gray-300 bg-white text-sm text-gray-700 hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={applyAddEmployees}
+                className="px-3 py-1.5 rounded bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700"
+              >
+                Add Selected
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1943,6 +2092,7 @@ export default function ManageSOPDashboard() {
 interface SopRowProps {
   sop: ManageSOPViewResponse['sops'][0];
   idx: number;
+  isUnassigned: boolean;
   departments: string[];
   designationsByDept: Record<string, string[]>;
   /** Sorted union of every designation across all departments. */
@@ -1956,6 +2106,7 @@ interface SopRowProps {
   viewMode: 'designation' | 'employee';
   employeesByDept: Record<string, Array<{ name: string; designation: string }>>;
   onEmployeeClick: (name: string, dept: string, designation: string) => void;
+  onOpenAddEmployee: (sopCode: string, sopName: string, dept: string) => void;
   setDesigChecked: (sopCode: string, dept: string, abbr: string, value: boolean) => void;
   setInductionChecked: (sopCode: string, dept: string, abbr: string, value: boolean) => void;
   setDeptChecked: (sopCode: string, dept: string, value: boolean) => void;
@@ -1970,6 +2121,7 @@ const cellInnerKeyHelper = (dept: string, month: number) => `${dept}|${month}`;
 const SopRow = memo(function SopRow({
   sop,
   idx,
+  isUnassigned,
   departments,
   designationsByDept,
   allDesignations,
@@ -1982,6 +2134,7 @@ const SopRow = memo(function SopRow({
   viewMode,
   employeesByDept,
   onEmployeeClick,
+  onOpenAddEmployee,
   setDesigChecked,
   setInductionChecked,
   setDeptChecked,
@@ -1989,24 +2142,12 @@ const SopRow = memo(function SopRow({
   toggleMonthCell,
   openCountPopup,
 }: SopRowProps) {
-  // Assigned = SOP has at least one scheduled month in any dept, OR is assigned
-  // to any dept via MatrixSOPAssignment. Same definition the assigned/unassigned
-  // card filter uses (see filteredSops above). Tinted bg makes allocation status
-  // visible at a glance — green for assigned, red for unassigned.
-  const isAssignedRow = sop.deptStats.some(
-    ds => ds.scheduledMonth || ds.isAssigned || ds.isScheduled,
-  );
-  const rowBg = isAssignedRow ? 'bg-green-50' : 'bg-red-50';
-  const rowHover = isAssignedRow ? 'hover:bg-green-100' : 'hover:bg-red-100';
+  // Always color rows from the same source used by the Unassigned card count/filter.
+  const rowBg = isUnassigned ? 'bg-red-50' : 'bg-green-50';
+  const rowHover = isUnassigned ? 'hover:bg-red-100' : 'hover:bg-green-100';
 
   return (
-    <tr
-      className={`border-b border-gray-200 ${rowHover} align-top`}
-      style={{
-        contentVisibility: 'auto',
-        containIntrinsicSize: 'auto 80px',
-      }}
-    >
+    <tr className={`border-b border-gray-200 ${rowHover} align-top`}>
       {/* SR NO */}
       <td className={`w-10 px-2 py-3 text-center font-medium text-gray-900 ${rowBg} align-top`}>
         {idx + 1}
@@ -2144,57 +2285,108 @@ const SopRow = memo(function SopRow({
                     ))}
                   </div>
                 ) : (
-                  <div className="flex flex-row flex-wrap items-center gap-x-3 gap-y-1">
-                    {(employeesByDept[dept] || []).length === 0 ? (
-                      <span className="text-[11px] text-gray-400 italic">No employees</span>
-                    ) : (
-                      (employeesByDept[dept] || []).map((emp, empIdx) => {
-                        // Match employee to their designation in the dynamic list (exact).
-                        // Toggling propagates to that designation so every employee of the
-                        // same designation moves together — matches MatrixSOPAssignment's
-                        // per-designation data model.
-                        const matched = desigStates.find(s => s.fullName === emp.designation);
-                        const trainingChecked = matched?.trainingChecked ?? false;
-                        const inductionChecked = matched?.inductionChecked ?? false;
-                        return (
-                          <div
-                            key={`emp-${sop.sopCode}-${dept}-${emp.name}-${empIdx}`}
-                            className="text-[11px] text-gray-800 inline-flex items-center gap-1"
-                            title={`${emp.name} (${emp.designation}) — left: Training Check · right: Induction Training`}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={trainingChecked}
-                              disabled={!matched}
-                              onChange={(e) => matched && setDesigChecked(sop.sopCode, dept, matched.fullName, e.target.checked)}
-                              onClick={(e) => e.stopPropagation()}
-                              className="w-3 h-3 cursor-pointer"
-                              aria-label={`Training: ${emp.name}`}
-                            />
-                            <button
-                              type="button"
-                              onClick={(ev) => {
-                                ev.stopPropagation();
-                                onEmployeeClick(emp.name, dept, emp.designation);
-                              }}
-                              className="font-medium text-blue-700 hover:underline cursor-pointer"
-                              title={`View SOPs for ${emp.name}`}
-                            >
-                              {emp.name}
-                            </button>
-                            <input
-                              type="checkbox"
-                              checked={inductionChecked}
-                              disabled={!matched}
-                              onChange={(e) => matched && setInductionChecked(sop.sopCode, dept, matched.fullName, e.target.checked)}
-                              onClick={(e) => e.stopPropagation()}
-                              className="w-3 h-3 cursor-pointer accent-orange-500"
-                              aria-label={`Induction: ${emp.name}`}
-                            />
-                          </div>
+                  <div className="flex flex-col gap-1">
+                    <div className="flex flex-row flex-wrap items-center gap-x-3 gap-y-1">
+                      {(() => {
+                        const norm = (v: unknown) => String(v || '').trim().toLowerCase();
+                        const byDesignation = new Map(
+                          desigStates.map((s) => [
+                            norm(s.fullName),
+                            { trainingChecked: s.trainingChecked, inductionChecked: s.inductionChecked, fullName: s.fullName },
+                          ]),
                         );
-                      })
-                    )}
+                        const hasSelectedMonth = (() => {
+                          const manualMonths = sopManualAllocations[dept] || [];
+                          for (let m = 1; m <= 12; m++) {
+                            const key = cellInnerKeyHelper(dept, m);
+                            const persisted = manualMonths.includes(m) || (deptStat?.scheduledMonth === m);
+                            const selected = key in sopMonthCells ? !!sopMonthCells[key] : persisted;
+                            if (selected) return true;
+                          }
+                          return false;
+                        })();
+
+                        const selectedEmployees = hasSelectedMonth
+                          ? (employeesByDept[dept] || []).filter((emp) => !!byDesignation.get(norm(emp.designation))?.trainingChecked)
+                          : [];
+
+                        if (selectedEmployees.length === 0) {
+                          return (
+                            <span className="text-[11px] text-gray-400 italic">No assigned employees</span>
+                          );
+                        }
+
+                        const MAX_VISIBLE = 8;
+                        const visible = selectedEmployees.slice(0, MAX_VISIBLE);
+                        return (
+                          <>
+                            {visible.map((emp, empIdx) => {
+                              const matched = byDesignation.get(norm(emp.designation));
+                              const trainingChecked = !!matched?.trainingChecked;
+                              const inductionChecked = !!matched?.inductionChecked;
+                              const fullName = matched?.fullName || emp.designation;
+                              return (
+                                <div
+                                  key={`emp-${sop.sopCode}-${dept}-${emp.name}-${empIdx}`}
+                                  className="inline-flex items-center gap-1"
+                                  title={`${emp.name} (${emp.designation}) — left: Training Check · right: Induction Training`}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={trainingChecked}
+                                    onChange={(ev) => {
+                                      ev.stopPropagation();
+                                      setDesigChecked(sop.sopCode, dept, fullName, ev.target.checked);
+                                    }}
+                                    className="w-3 h-3 cursor-pointer"
+                                    aria-label={`Training: ${emp.name}`}
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={(ev) => {
+                                      ev.stopPropagation();
+                                      onEmployeeClick(emp.name, dept, emp.designation);
+                                    }}
+                                    className="font-medium text-[11px] text-blue-700 hover:underline cursor-pointer"
+                                    title={`${emp.name} (${emp.designation})`}
+                                  >
+                                    {emp.name}
+                                  </button>
+                                  <input
+                                    type="checkbox"
+                                    checked={inductionChecked}
+                                    onChange={(ev) => {
+                                      ev.stopPropagation();
+                                      setInductionChecked(sop.sopCode, dept, fullName, ev.target.checked);
+                                    }}
+                                    className="w-3 h-3 cursor-pointer accent-orange-500"
+                                    aria-label={`Induction: ${emp.name}`}
+                                  />
+                                </div>
+                              );
+                            })}
+                            {selectedEmployees.length > MAX_VISIBLE ? (
+                              <span className="text-[11px] text-gray-500">
+                                +{selectedEmployees.length - MAX_VISIBLE} more
+                              </span>
+                            ) : null}
+                          </>
+                        );
+                      })()}
+                    </div>
+                    <div>
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          onOpenAddEmployee(sop.sopCode, sop.sopName || sop.sopCode, dept);
+                        }}
+                        className="inline-flex items-center rounded border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-semibold text-blue-700 hover:bg-blue-100"
+                        title={`Add employees for ${DEPT_ABBR[dept]} to ${sop.sopCode}`}
+                      >
+                        + Add Employee
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>

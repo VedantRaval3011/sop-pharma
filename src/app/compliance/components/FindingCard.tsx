@@ -1,9 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { ChevronDown, ChevronUp, BookOpen, FileText, Hash, AlignLeft, ExternalLink } from 'lucide-react';
-
-// Updated: Dark theme for compliance dashboard
+import { ChevronDown, ChevronUp, BookOpen, FileText, Hash, AlignLeft, Copy, CheckCircle2, AlertTriangle, XCircle, Info } from 'lucide-react';
 
 export interface FindingCardProps {
   id: string;
@@ -13,7 +11,7 @@ export interface FindingCardProps {
   suggestion: string;
   reference: string;
   severity: 'critical' | 'major' | 'minor' | 'informational';
-  status: 'compliant' | 'partial' | 'non-compliant' | 'not-applicable';
+  status: 'compliant' | 'partial' | 'non-compliant' | 'not-applicable' | 'analysis-failed';
   confidence: number;
   sopSection?: string;
   sopTextSnippet?: string;
@@ -28,63 +26,79 @@ export interface FindingCardProps {
   isApplicable?: boolean;
 }
 
+// ─── Design tokens ────────────────────────────────────────────────────────────
+
 const severityConfig = {
   critical: {
-    bg: 'bg-rose-500/10',
-    border: 'border-rose-500/30',
-    text: 'text-rose-400',
-    badge: 'bg-rose-500/20 text-rose-300 border-rose-500/40',
-    icon: '🔴',
+    accent:  'border-l-rose-500',
+    badge:   'bg-rose-50 text-rose-700 border-rose-200',
+    icon:    <XCircle className="h-3 w-3" />,
+    label:   'Critical',
   },
   major: {
-    bg: 'bg-orange-500/10',
-    border: 'border-orange-500/30',
-    text: 'text-orange-400',
-    badge: 'bg-orange-500/20 text-orange-300 border-orange-500/40',
-    icon: '🟠',
+    accent:  'border-l-orange-500',
+    badge:   'bg-orange-50 text-orange-700 border-orange-200',
+    icon:    <AlertTriangle className="h-3 w-3" />,
+    label:   'Major',
   },
   minor: {
-    bg: 'bg-amber-500/10',
-    border: 'border-amber-500/30',
-    text: 'text-amber-400',
-    badge: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
-    icon: '🟡',
+    accent:  'border-l-amber-400',
+    badge:   'bg-amber-50 text-amber-700 border-amber-200',
+    icon:    <AlertTriangle className="h-3 w-3" />,
+    label:   'Minor',
   },
   informational: {
-    bg: 'bg-blue-500/10',
-    border: 'border-blue-500/30',
-    text: 'text-blue-400',
-    badge: 'bg-blue-500/20 text-blue-300 border-blue-500/40',
-    icon: '🔵',
+    accent:  'border-l-blue-400',
+    badge:   'bg-blue-50 text-blue-700 border-blue-200',
+    icon:    <Info className="h-3 w-3" />,
+    label:   'Info',
   },
-};
+} as const;
 
 const statusConfig = {
   compliant: {
-    bg: 'bg-emerald-500/20',
-    text: 'text-emerald-300',
-    border: 'border-emerald-500/40',
-    label: 'Compliant',
+    badge:       'bg-emerald-50 text-emerald-700 border-emerald-200',
+    sectionBg:   'bg-emerald-50 border-emerald-200',
+    headingText: 'text-emerald-700',
+    icon:        <CheckCircle2 className="h-3.5 w-3.5" />,
+    label:       'Compliant',
+    dot:         'bg-emerald-500',
   },
   partial: {
-    bg: 'bg-amber-500/20',
-    text: 'text-amber-300',
-    border: 'border-amber-500/40',
-    label: 'Partially Compliant',
+    badge:       'bg-amber-50 text-amber-700 border-amber-200',
+    sectionBg:   'bg-amber-50 border-amber-200',
+    headingText: 'text-amber-700',
+    icon:        <AlertTriangle className="h-3.5 w-3.5" />,
+    label:       'Partially Compliant',
+    dot:         'bg-amber-500',
   },
   'non-compliant': {
-    bg: 'bg-rose-500/20',
-    text: 'text-rose-300',
-    border: 'border-rose-500/40',
-    label: 'Non-Compliant',
+    badge:       'bg-rose-50 text-rose-700 border-rose-200',
+    sectionBg:   'bg-rose-50 border-rose-200',
+    headingText: 'text-rose-700',
+    icon:        <XCircle className="h-3.5 w-3.5" />,
+    label:       'Non-Compliant',
+    dot:         'bg-rose-500',
   },
   'not-applicable': {
-    bg: 'bg-slate-700/50',
-    text: 'text-slate-300',
-    border: 'border-slate-600/50',
-    label: 'Not Applicable',
+    badge:       'bg-slate-100 text-slate-600 border-slate-200',
+    sectionBg:   'bg-slate-50 border-slate-200',
+    headingText: 'text-slate-600',
+    icon:        <Info className="h-3.5 w-3.5" />,
+    label:       'Not Applicable',
+    dot:         'bg-slate-400',
   },
-};
+  'analysis-failed': {
+    badge:       'bg-gray-100 text-gray-600 border-gray-200',
+    sectionBg:   'bg-gray-50 border-gray-200',
+    headingText: 'text-gray-600',
+    icon:        <Info className="h-3.5 w-3.5" />,
+    label:       'Inconclusive',
+    dot:         'bg-gray-400',
+  },
+} as const;
+
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function FindingCard({
   id,
@@ -108,245 +122,215 @@ export default function FindingCard({
   onToggleApplicable,
   isApplicable = false,
 }: FindingCardProps) {
-  // Normalise status key: AI sometimes returns "non_compliant" or "notApplicable" variants
+  const [guidelineExpanded, setGuidelineExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+
   const normStatus = (status || '')
     .toLowerCase()
     .replace(/_/g, '-') as keyof typeof statusConfig;
-  const severityStyle = severityConfig[severity as keyof typeof severityConfig] ?? severityConfig.informational;
-  const statusStyle  = statusConfig[normStatus] ?? statusConfig.partial;
-  const [guidelineExpanded, setGuidelineExpanded] = useState(false);
+  const sevStyle    = severityConfig[severity as keyof typeof severityConfig] ?? severityConfig.informational;
+  const statStyle   = statusConfig[normStatus] ?? statusConfig['analysis-failed'];
+  const breadcrumb  = reference.split(' → ');
 
-  // Helper to get breadcrumb from reference
-  const breadcrumb = reference.split(' → ');
+  const resolvedGuidelineName = guidelineName || breadcrumb[breadcrumb.length - 1] || 'Unknown Guideline';
+  const resolvedFolderName    = folderName || breadcrumb[0] || '';
 
-  // Helper to extract a better reference if clauseNumber is technical (e.g., "1049")
-  const displayClause = React.useMemo(() => {
-    if (!clauseNumber) return 'GUIDELINE';
-    
-    // Check if clauseNumber is a technical-looking ID (3+ digits)
-    const isTechnicalId = /^\d{3,}$/.test(clauseNumber);
-    
-    if (isTechnicalId) {
-      // Try to find a reference in parentheses at the end: (ICH Q7, 5.20)
-      const parenMatch = requirement.match(/\(([^)]+)\)[^.?!]*$/);
-      if (parenMatch) {
-         // Clean up: remove redundant "Ref." or similar if AI added it
-         return parenMatch[1].replace(/Ref[:\s]*/i, '').trim();
-      }
-      
-      // Look for "Section X.Y" or "Clause X.Y" patterns
-      const sectionMatch = requirement.match(/(Section|Clause)\s+([\d.]+)/i);
-      if (sectionMatch) {
-         return `${sectionMatch[1]} ${sectionMatch[2]}`;
-      }
-    }
-    
-    return clauseNumber;
-  }, [clauseNumber, requirement]);
-
-  // Extract page number from clauseNumber if it's a large numeric ID (e.g. "1083" → page 1083)
   const pageNumber = React.useMemo(() => {
     if (!clauseNumber) return null;
-    // If clauseNumber is purely numeric and >= 3 digits, treat it as a page reference
     if (/^\d{3,}$/.test(clauseNumber)) return clauseNumber;
-    // Look for [page] pattern in clauseNumber like "5.2.1 [p.45]"
-    const pageMatch = clauseNumber.match(/\[p\.?\s*(\d+)\]/i);
-    if (pageMatch) return pageMatch[1];
-    return null;
+    return clauseNumber.match(/\[p\.?\s*(\d+)\]/i)?.[1] ?? null;
   }, [clauseNumber]);
 
-  // Determine the "real" clause display (non-page version)
   const realClauseNumber = React.useMemo(() => {
     if (!clauseNumber) return null;
-    if (/^\d{3,}$/.test(clauseNumber)) return null; // It's a page number, not a clause
+    if (/^\d{3,}$/.test(clauseNumber)) return null;
     return clauseNumber;
   }, [clauseNumber]);
 
-  // Resolve guideline name from reference or prop
-  const resolvedGuidelineName = guidelineName || breadcrumb[breadcrumb.length - 1] || 'Unknown Guideline';
-  const resolvedFolderName = folderName || breadcrumb[0] || '';
+  const cleanSuggestion = suggestion.replace(/```[\s\S]*?```/g, '').trim();
+  const inlineSuggestedText = suggestedText || suggestion.match(/```([\s\S]*?)```/)?.[1] || '';
+
+  function copyText(text: string) {
+    navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
 
   return (
-    <div
-      className={`rounded-2xl border ${severityStyle.border} bg-white/5 backdrop-blur-md shadow-xl hover:shadow-purple-500/10 transition-all duration-300 overflow-hidden group`}
-    >
-      {/* Header */}
-      <div className="p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white/5 border-b border-white/5">
-        <div className="flex items-center gap-4">
-          {/* 3D Indicator Sphere */}
-          <div className="relative">
-            <div className={`w-10 h-10 rounded-full shadow-[inset_-2px_-2px_6px_rgba(0,0,0,0.5),inset_2px_2px_6px_rgba(255,255,255,0.2)] ${
-              status === 'compliant' ? 'bg-gradient-to-br from-emerald-400 to-emerald-600' :
-              status === 'partial' ? 'bg-gradient-to-br from-amber-400 to-amber-600' :
-              'bg-gradient-to-br from-rose-400 to-rose-600'
-            }`} />
-            <div className="absolute top-1.5 left-2 w-3 h-1.5 bg-white/30 rounded-[50%] blur-[0.5px] -rotate-[30deg]" />
-          </div>
+    <div className={`bg-white rounded-2xl border border-gray-200 shadow-sm border-l-4 ${sevStyle.accent} overflow-hidden transition-shadow hover:shadow-md`}>
 
-          <div>
-            <div className="flex flex-wrap items-center gap-2 mb-1.5">
-              <span className={`px-2 py-0.5 rounded-md text-[10px] font-black uppercase tracking-widest border shadow-sm ${severityStyle.badge}`}>
-                {severity}
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      <div className="px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-gray-100">
+
+        {/* Left: status dot + badges + breadcrumb */}
+        <div className="flex items-start gap-3 min-w-0">
+          {/* Status dot */}
+          <div className={`mt-1 w-2.5 h-2.5 rounded-full flex-shrink-0 ${statStyle.dot}`} />
+
+          <div className="min-w-0">
+            {/* Badges row */}
+            <div className="flex flex-wrap items-center gap-1.5 mb-1.5">
+              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold border uppercase tracking-wider ${statStyle.badge}`}>
+                {statStyle.icon}
+                {statStyle.label}
               </span>
-              <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider border shadow-sm ${statusStyle.bg} ${statusStyle.text} ${statusStyle.border}`}>
-                {statusStyle.label}
+              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold border uppercase tracking-wider ${sevStyle.badge}`}>
+                {sevStyle.icon}
+                {sevStyle.label}
               </span>
             </div>
-            <div className="flex items-center gap-1 text-[10px] font-bold text-slate-500 uppercase tracking-widest">
-              <span className="opacity-50">📄</span>
+
+            {/* Guideline breadcrumb */}
+            <div className="flex flex-wrap items-center gap-1 text-[10px] font-semibold text-gray-400 uppercase tracking-wide">
               {breadcrumb.map((item, idx) => (
                 <React.Fragment key={idx}>
-                  <span className={idx === breadcrumb.length - 1 ? 'text-slate-400' : ''}>{item}</span>
-                  {idx < breadcrumb.length - 1 && <span className="mx-1 opacity-30">→</span>}
+                  <span className={idx === breadcrumb.length - 1 ? 'text-gray-500' : 'text-gray-400'}>
+                    {item}
+                  </span>
+                  {idx < breadcrumb.length - 1 && <span className="text-gray-300">›</span>}
                 </React.Fragment>
               ))}
-              {displayClause && <span className="mx-1 opacity-30">→</span>}
-              <span className="text-slate-400">{displayClause}</span>
+              {(realClauseNumber || pageNumber) && (
+                <>
+                  <span className="text-gray-300">›</span>
+                  <span className="text-purple-500 font-bold">
+                    {realClauseNumber ?? `p.${pageNumber}`}
+                  </span>
+                </>
+              )}
             </div>
           </div>
         </div>
-        
-        <div className="flex items-center gap-3">
-           {/* Expand Guideline Reference Button */}
-           <button
-             onClick={() => setGuidelineExpanded(v => !v)}
-             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border ${
-               guidelineExpanded
-                 ? 'bg-blue-500/20 border-blue-500/40 text-blue-300'
-                 : 'bg-white/5 border-white/10 text-slate-400 hover:border-blue-500/30 hover:text-blue-300'
-             }`}
-             title="View guideline source details"
-           >
-             <BookOpen className="h-3 w-3" />
-             Source
-             {guidelineExpanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-           </button>
 
-           {/* Applicable Checkbox */}
-           {onToggleApplicable && status !== 'compliant' && (
-             <div className="flex items-center gap-2 px-3 py-2 bg-white/5 rounded-lg border border-purple-500/30 hover:border-purple-500/50 transition-all">
-               <input
-                 type="checkbox"
-                 id={`applicable-${id}`}
-                 checked={isApplicable}
-                 onChange={(e) => onToggleApplicable(id, e.target.checked)}
-                 className="w-4 h-4 rounded border-2 border-purple-500/50 bg-slate-900/50 
-                            checked:bg-purple-600 checked:border-purple-500 
-                            focus:ring-2 focus:ring-purple-500/30 focus:ring-offset-0
-                            cursor-pointer transition-all accent-purple-600"
-               />
-               <label 
-                 htmlFor={`applicable-${id}`}
-                 className="text-xs text-slate-400 cursor-pointer select-none hover:text-purple-300 transition-colors font-medium"
-               >
-                 Applicable
-               </label>
-             </div>
-           )}
-           
-           <div className="text-right">
-              <p className="text-[10px] text-slate-500 uppercase tracking-widest font-black mb-0.5">Confidence</p>
-              <div className="text-2xl font-black tracking-tighter text-emerald-400/90">
-                {confidence}%
-              </div>
-           </div>
+        {/* Right: guideline source toggle + applicable checkbox + confidence */}
+        <div className="flex items-center gap-3 flex-shrink-0">
+          {/* Source toggle */}
+          <button
+            onClick={() => setGuidelineExpanded(v => !v)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-all ${
+              guidelineExpanded
+                ? 'bg-purple-50 border-purple-300 text-purple-700'
+                : 'bg-gray-50 border-gray-200 text-gray-500 hover:border-purple-300 hover:text-purple-600 hover:bg-purple-50'
+            }`}
+          >
+            <BookOpen className="h-3 w-3" />
+            Source
+            {guidelineExpanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+          </button>
+
+          {/* Applicable checkbox */}
+          {onToggleApplicable && normStatus !== 'compliant' && (
+            <label className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border cursor-pointer select-none transition-all text-xs font-semibold ${
+              isApplicable
+                ? 'bg-purple-50 border-purple-300 text-purple-700'
+                : 'bg-gray-50 border-gray-200 text-gray-500 hover:border-purple-300 hover:text-purple-600'
+            }`}>
+              <input
+                type="checkbox"
+                id={`applicable-${id}`}
+                checked={isApplicable}
+                onChange={(e) => onToggleApplicable(id, e.target.checked)}
+                className="w-3.5 h-3.5 rounded accent-purple-600 cursor-pointer"
+              />
+              Applicable
+            </label>
+          )}
+
+          {/* Confidence */}
+          <div className="text-right">
+            <p className="text-[9px] text-gray-400 font-bold uppercase tracking-widest leading-none mb-0.5">Confidence</p>
+            <p className={`text-lg font-black tabular-nums leading-none ${
+              confidence >= 80 ? 'text-emerald-600' :
+              confidence >= 50 ? 'text-amber-600' :
+              'text-rose-500'
+            }`}>
+              {confidence}%
+            </p>
+          </div>
         </div>
       </div>
 
-      {/* ── Guideline Reference Expand Panel ─────────────────────────────── */}
+      {/* ── Guideline Source Panel ──────────────────────────────────────────── */}
       {guidelineExpanded && (
-        <div className="border-b border-blue-500/20 bg-gradient-to-br from-blue-950/40 to-slate-900/60 animate-in slide-in-from-top-1 duration-200">
-          <div className="px-6 py-4 space-y-4">
-            {/* Header row */}
-            <div className="flex items-center gap-2 mb-1">
-              <BookOpen className="h-4 w-4 text-blue-400" />
-              <span className="text-[10px] font-black text-blue-400 uppercase tracking-[0.2em]">Guideline Source Reference</span>
-            </div>
+        <div className="border-b border-purple-100 bg-purple-50/50 animate-in slide-in-from-top-1 duration-150">
+          <div className="px-5 py-4 space-y-3">
+            <p className="text-[9px] font-black text-purple-600 uppercase tracking-[0.2em] flex items-center gap-1.5">
+              <BookOpen className="h-3 w-3" /> Guideline Source Reference
+            </p>
 
-            {/* Info grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              {/* Guideline Name */}
-              <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl p-3">
-                <div className="flex items-center gap-1.5 mb-1">
-                  <BookOpen className="h-3 w-3 text-blue-400" />
-                  <span className="text-[9px] font-black text-blue-400 uppercase tracking-widest">Guideline</span>
-                </div>
-                <p className="text-sm font-bold text-white leading-tight">{resolvedGuidelineName}</p>
-                {resolvedFolderName && (
-                  <p className="text-[10px] text-blue-300/70 mt-0.5">{resolvedFolderName}</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+              {/* Guideline name */}
+              <div className="bg-white border border-purple-200 rounded-xl p-3">
+                <p className="text-[9px] font-black text-purple-500 uppercase tracking-widest mb-1 flex items-center gap-1">
+                  <BookOpen className="h-2.5 w-2.5" /> Guideline
+                </p>
+                <p className="text-sm font-bold text-gray-800 leading-tight">{resolvedGuidelineName}</p>
+                {resolvedFolderName && resolvedFolderName !== resolvedGuidelineName && (
+                  <p className="text-[10px] text-gray-400 mt-0.5">{resolvedFolderName}</p>
                 )}
               </div>
 
-              {/* PDF / Document */}
+              {/* PDF */}
               {pdfName && (
-                <div className="bg-slate-700/40 border border-white/10 rounded-xl p-3">
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <FileText className="h-3 w-3 text-slate-400" />
-                    <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Document</span>
-                  </div>
-                  <p className="text-sm font-bold text-slate-200 leading-tight break-all">{pdfName}</p>
+                <div className="bg-white border border-gray-200 rounded-xl p-3">
+                  <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1 flex items-center gap-1">
+                    <FileText className="h-2.5 w-2.5" /> Document
+                  </p>
+                  <p className="text-sm font-semibold text-gray-700 leading-tight break-all">{pdfName}</p>
                 </div>
               )}
 
-              {/* Page Number */}
+              {/* Page reference */}
               {pageNumber && (
-                <div className="bg-purple-500/10 border border-purple-500/20 rounded-xl p-3">
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <Hash className="h-3 w-3 text-purple-400" />
-                    <span className="text-[9px] font-black text-purple-400 uppercase tracking-widest">Page Reference</span>
-                  </div>
-                  <p className="text-2xl font-black text-purple-300 leading-none">p.{pageNumber}</p>
-                  <p className="text-[9px] text-purple-400/60 mt-0.5">Source page number</p>
+                <div className="bg-white border border-purple-200 rounded-xl p-3">
+                  <p className="text-[9px] font-black text-purple-500 uppercase tracking-widest mb-1 flex items-center gap-1">
+                    <Hash className="h-2.5 w-2.5" /> Page Reference
+                  </p>
+                  <p className="text-xl font-black text-purple-700">p.{pageNumber}</p>
                 </div>
               )}
 
-              {/* Clause Number (only if it's a real clause, not a page ID) */}
+              {/* Clause number */}
               {realClauseNumber && (
-                <div className="bg-slate-700/40 border border-white/10 rounded-xl p-3">
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <Hash className="h-3 w-3 text-slate-400" />
-                    <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Clause</span>
-                  </div>
-                  <p className="text-sm font-black text-white font-mono">{realClauseNumber}</p>
-                  {clauseTitle && (
-                    <p className="text-[10px] text-slate-400 mt-0.5 leading-tight">{clauseTitle}</p>
-                  )}
+                <div className="bg-white border border-gray-200 rounded-xl p-3">
+                  <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1 flex items-center gap-1">
+                    <Hash className="h-2.5 w-2.5" /> Clause
+                  </p>
+                  <p className="text-sm font-black text-gray-800 font-mono">{realClauseNumber}</p>
+                  {clauseTitle && <p className="text-[10px] text-gray-400 mt-0.5 leading-tight">{clauseTitle}</p>}
                 </div>
               )}
 
-              {/* Clause Title (standalone if no clause number) */}
+              {/* Clause title standalone */}
               {clauseTitle && !realClauseNumber && (
-                <div className="bg-slate-700/40 border border-white/10 rounded-xl p-3 sm:col-span-2">
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <AlignLeft className="h-3 w-3 text-slate-400" />
-                    <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Clause Title</span>
-                  </div>
-                  <p className="text-sm font-bold text-slate-200 leading-tight">{clauseTitle}</p>
+                <div className="bg-white border border-gray-200 rounded-xl p-3 sm:col-span-2">
+                  <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest mb-1 flex items-center gap-1">
+                    <AlignLeft className="h-2.5 w-2.5" /> Clause Title
+                  </p>
+                  <p className="text-sm font-semibold text-gray-700 leading-tight">{clauseTitle}</p>
                 </div>
               )}
             </div>
 
-            {/* Full Clause Text */}
+            {/* Full clause text */}
             {(clauseText || requirement) && (
-              <div className="bg-black/30 border border-white/5 rounded-xl overflow-hidden">
-                <div className="px-4 py-2 bg-white/5 border-b border-white/5 flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <AlignLeft className="h-3 w-3 text-blue-400" />
-                    <span className="text-[9px] font-black text-blue-400 uppercase tracking-widest">
-                      Guideline Text
-                      {realClauseNumber && <span className="ml-1 text-blue-300/60">— Clause {realClauseNumber}</span>}
-                      {pageNumber && <span className="ml-1 text-purple-300/60">— Page {pageNumber}</span>}
-                    </span>
-                  </div>
+              <div className="bg-white border border-purple-100 rounded-xl overflow-hidden">
+                <div className="px-4 py-2 bg-purple-50 border-b border-purple-100 flex items-center justify-between">
+                  <span className="text-[9px] font-black text-purple-600 uppercase tracking-widest flex items-center gap-1.5">
+                    <AlignLeft className="h-2.5 w-2.5" />
+                    Guideline Text
+                    {realClauseNumber && <span className="text-purple-400">— Clause {realClauseNumber}</span>}
+                    {pageNumber && <span className="text-purple-400">— Page {pageNumber}</span>}
+                  </span>
                   <button
-                    onClick={() => navigator.clipboard.writeText(clauseText || requirement)}
-                    className="text-[9px] text-slate-500 hover:text-white transition-colors"
+                    onClick={() => copyText(clauseText || requirement)}
+                    className="text-[9px] text-gray-400 hover:text-purple-600 font-bold uppercase tracking-wider transition-colors flex items-center gap-1"
                   >
-                    COPY
+                    <Copy className="h-2.5 w-2.5" /> Copy
                   </button>
                 </div>
                 <div className="p-4">
-                  <p className="text-slate-300 text-xs leading-relaxed font-mono whitespace-pre-wrap border-l-2 border-blue-500/30 pl-3">
+                  <p className="text-gray-600 text-xs leading-relaxed border-l-2 border-purple-300 pl-3">
                     {clauseText || requirement}
                   </p>
                 </div>
@@ -356,89 +340,104 @@ export default function FindingCard({
         </div>
       )}
 
-      {/* Content Body */}
-      <div className="p-6 space-y-6">
-        
+      {/* ── Body ───────────────────────────────────────────────────────────── */}
+      <div className="p-5 space-y-5">
+
         {/* 1. Guideline Requirement */}
-        <div className="space-y-3">
-          <h4 className="text-slate-500 text-[10px] font-black uppercase tracking-[0.2em] flex items-center gap-2">
-            <span className="text-rose-400">⚒️ ⚒️</span> Guideline Requirement
-          </h4>
-          <p className="text-slate-200 text-sm font-bold leading-relaxed">
+        <div>
+          <p className="text-[9px] font-black text-gray-400 uppercase tracking-[0.18em] mb-2 flex items-center gap-1.5">
+            <BookOpen className="h-3 w-3 text-purple-400" />
+            Guideline Requirement
+          </p>
+          <p className="text-gray-800 text-sm font-semibold leading-relaxed">
             {requirement}
           </p>
         </div>
 
-        {/* 2. SOP Context (If available) */}
+        {/* 2. Current SOP Content */}
         {sopTextSnippet && (
-           <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
-             <h4 className="text-slate-500 text-[10px] font-black uppercase tracking-[0.2em] mb-3 flex items-center gap-2">
-               <span>📄</span> Current SOP Content
-             </h4>
-             <p className="text-slate-300 text-sm italic leading-relaxed pl-4 border-l-2 border-purple-500/50">
-               "{sopTextSnippet}"
-             </p>
-             {sopSection && (
-               <p className="text-[10px] text-slate-500 mt-2 font-bold uppercase tracking-widest">Section: {sopSection}</p>
-             )}
-           </div>
+          <div className="bg-purple-50 border border-purple-200 rounded-xl p-4">
+            <p className="text-[9px] font-black text-purple-600 uppercase tracking-[0.18em] mb-2.5 flex items-center gap-1.5">
+              <FileText className="h-3 w-3" />
+              Current SOP Content
+            </p>
+            <p className="text-gray-700 text-sm italic leading-relaxed border-l-2 border-purple-400 pl-3">
+              "{sopTextSnippet}"
+            </p>
+            {sopSection && (
+              <p className="text-[10px] text-purple-500 font-bold mt-2 uppercase tracking-wider">
+                Section: {sopSection}
+              </p>
+            )}
+          </div>
         )}
 
-        {/* 3. Analysis details */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* 3. Gap + Impact grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {/* Gap */}
-          <div className="space-y-3">
-             <h4 className="text-amber-400/80 text-[10px] font-black uppercase tracking-[0.2em] flex items-center gap-2">
-               <span>⚠️</span> Gap Identified
-             </h4>
-             <div className="text-slate-300 text-sm leading-relaxed">
-                {gap}
-             </div>
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+            <p className="text-[9px] font-black text-amber-700 uppercase tracking-[0.18em] mb-2 flex items-center gap-1.5">
+              <AlertTriangle className="h-3 w-3" />
+              Gap Identified
+            </p>
+            <p className="text-gray-700 text-sm leading-relaxed">
+              {gap}
+            </p>
           </div>
 
           {/* Impact */}
-          <div className="space-y-3">
-             <h4 className="text-orange-400/80 text-[10px] font-black uppercase tracking-[0.2em] flex items-center gap-2">
-               <span>💥</span> Impact Analysis
-             </h4>
-             <p className="text-slate-300 text-sm leading-relaxed">
-                {impact}
-             </p>
+          <div className="bg-orange-50 border border-orange-200 rounded-xl p-4">
+            <p className="text-[9px] font-black text-orange-700 uppercase tracking-[0.18em] mb-2 flex items-center gap-1.5">
+              <XCircle className="h-3 w-3" />
+              Impact Analysis
+            </p>
+            <p className="text-gray-700 text-sm leading-relaxed">
+              {impact}
+            </p>
           </div>
         </div>
 
-        {/* 4. Recommendation */}
-        <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-2xl p-5 shadow-inner">
-           <h4 className="text-emerald-400 text-[10px] font-black uppercase tracking-[0.2em] mb-4 flex items-center gap-2">
-             <span>✅</span> Suggested Action
-           </h4>
-           
-           <div className="space-y-4">
-             <p className="text-slate-200 text-sm font-bold leading-relaxed">
-               {suggestion.replace(/```[\s\S]*?```/g, '').trim()}
-             </p>
+        {/* 4. Suggested Action */}
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-emerald-200 flex items-center gap-1.5">
+            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+            <p className="text-[9px] font-black text-emerald-700 uppercase tracking-[0.18em]">
+              Suggested Action
+            </p>
+          </div>
 
-             {/* Suggested Text Block */}
-             {(suggestedText || (suggestion.match(/```([\s\S]*?)```/)?.[1])) && (
-                <div className="mt-4 bg-black/40 rounded-xl border border-white/5 overflow-hidden">
-                   <div className="px-4 py-2 bg-white/5 border-b border-white/5 flex justify-between items-center">
-                      <span className="text-[9px] text-emerald-400 font-black uppercase tracking-widest">Proposed Verbiage</span>
-                      <button 
-                        onClick={() => navigator.clipboard.writeText(suggestedText || suggestion.match(/```([\s\S]*?)```/)?.[1] || '')}
-                        className="text-[9px] text-slate-500 hover:text-white transition-colors"
-                      >
-                        COPY
-                       </button>
-                    </div>
-                    <div className="p-4">
-                       <pre className="text-slate-300 font-mono text-xs whitespace-pre-wrap leading-relaxed">
-                         {suggestedText || suggestion.match(/```([\s\S]*?)```/)?.[1]}
-                       </pre>
-                    </div>
-                 </div>
-              )}
-            </div>
-         </div>
+          <div className="p-4 space-y-4">
+            <p className="text-gray-700 text-sm font-medium leading-relaxed">
+              {cleanSuggestion}
+            </p>
+
+            {/* Proposed Verbiage */}
+            {inlineSuggestedText && (
+              <div className="bg-white border border-emerald-200 rounded-xl overflow-hidden">
+                <div className="px-4 py-2 bg-emerald-50 border-b border-emerald-100 flex items-center justify-between">
+                  <span className="text-[9px] font-black text-emerald-700 uppercase tracking-widest">
+                    Proposed Verbiage
+                  </span>
+                  <button
+                    onClick={() => copyText(inlineSuggestedText)}
+                    className="flex items-center gap-1 text-[9px] font-bold text-gray-400 hover:text-emerald-700 uppercase tracking-wider transition-colors"
+                  >
+                    {copied ? (
+                      <><CheckCircle2 className="h-2.5 w-2.5 text-emerald-600" /> Copied</>
+                    ) : (
+                      <><Copy className="h-2.5 w-2.5" /> Copy</>
+                    )}
+                  </button>
+                </div>
+                <div className="p-4">
+                  <pre className="text-gray-700 font-mono text-xs whitespace-pre-wrap leading-relaxed">
+                    {inlineSuggestedText}
+                  </pre>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
 
       </div>
     </div>

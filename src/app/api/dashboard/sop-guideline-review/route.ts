@@ -6,6 +6,7 @@ import SOPGuideline from '@/models/SOPGuideline';
 import SOPGuidelineResult from '@/models/SOPGuidelineResult';
 import ComplianceReport from '@/models/ComplianceReport';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { normalizeSopIdentifierKey } from '@/lib/sopIdentifierNormalize';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 300; // 5 min — same as compliance engine
@@ -362,8 +363,9 @@ export async function GET(request: NextRequest) {
       // Build a map keyed by sopNo so we can merge
       const cache: Record<string, any> = {};
       for (const r of wizardResults) {
-        cache[r.sopNo] = {
-          sopNo: r.sopNo,
+        const nk = normalizeSopIdentifierKey(r.sopNo || '');
+        cache[nk] = {
+          sopNo: nk,
           sopName: r.sopName || '',
           overallScore: r.overallScore ?? 0,
           clausesAnalyzed: r.clausesAnalyzed ?? 0,
@@ -393,8 +395,8 @@ export async function GET(request: NextRequest) {
           .lean();
 
         for (const r of complianceReports) {
-          const key = r.sopIdentifier;
-          if (!key) continue;
+          if (!r.sopIdentifier) continue;
+          const key = normalizeSopIdentifierKey(r.sopIdentifier);
 
           const normalizedFindings = normalizeComplianceFindings(r.findings || []);
 
@@ -427,15 +429,19 @@ export async function GET(request: NextRequest) {
     }
 
     if (sopNo) {
-      // Check wizard results first
-      const wizardResult: any = await SOPGuidelineResult.findOne({ sopNo }).lean();
+      const normalizedSopNo = normalizeSopIdentifierKey(sopNo);
+      // Check wizard results first (try both normalized and raw form)
+      const wizardResult: any = await SOPGuidelineResult.findOne({
+        sopNo: { $in: [normalizedSopNo, sopNo] },
+      }).lean();
 
-      // Always also fetch the latest compliance report so we can backfill findings
+      // Always also fetch the latest compliance report so we can backfill findings.
+      // Query by both normalized and raw identifier to handle legacy records.
       let complianceFindings: any[] = [];
       let complianceReport: any = null;
       try {
         complianceReport = await ComplianceReport
-          .findOne({ sopIdentifier: sopNo, analysisStatus: 'completed' })
+          .findOne({ sopIdentifier: { $in: [normalizedSopNo, sopNo] }, analysisStatus: 'completed' })
           .sort({ analysisCompletedAt: -1 })
           .allowDiskUse(true)
           .lean();
@@ -452,7 +458,7 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({
           success: true,
           source: 'dashboard-wizard',
-          result: { ...wizardResult, findings },
+          result: { ...wizardResult, sopNo: normalizedSopNo, findings },
         });
       }
 
@@ -461,7 +467,7 @@ export async function GET(request: NextRequest) {
           success: true,
           source: 'compliance-section',
           result: {
-            sopNo: complianceReport.sopIdentifier,
+            sopNo: normalizedSopNo,
             sopName: complianceReport.sopName || '',
             overallScore: complianceReport.overallScore ?? 0,
             clausesAnalyzed: complianceReport.scoreBreakdown?.totalChecks ?? 0,

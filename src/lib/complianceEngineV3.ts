@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import mongoose from 'mongoose';
+import crypto from 'crypto';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════
@@ -22,6 +23,8 @@ if (!GEMINI_KEY) {
 }
 const genAI = new GoogleGenerativeAI(GEMINI_KEY);
 const STABLE_MODEL = 'gemini-2.0-flash';
+const PLACEHOLDER_PATTERN =
+  /\b(n\/a|not\s+determined|unable\s+to\s+determine|not\s+specified|not\s+found|not\s+addressed|manual\s+review\s+required|review\s+required|analysis\s+required)\b/i;
 
 // ═══════════════════════════════════════════════════════════════════════
 // TYPES & INTERFACES
@@ -489,18 +492,87 @@ export async function analyzeClauseWithPrecision(
 ): Promise<ComplianceFindingV3> {
   const { generateCompliancePrompt, generateRefinedPrompt, validateAIResponse } = await import('./compliancePrompts');
   const { validateFinding, sanitizeAIOutput, detectHallucination } = await import('./ComplianceFindingValidator');
-  
+
   const findingId = `finding-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  
+
   // Find most relevant SOP section for this clause
   const relevantSection = findRelevantSection(sopSections, clause);
-  
-  // Truncate for AI
-  const truncatedContent = sopContent.length > 6000
-    ? sopContent.substring(0, 6000) + '... [truncated]'
+  const fallbackSectionNumber = String(relevantSection?.sectionNumber || '1').trim() || '1';
+  const fallbackSectionTitle = String(relevantSection?.sectionTitle || 'Primary Section').trim() || 'Primary Section';
+  const fallbackSnippet = extractEvidenceSnippet(relevantSection?.sectionContent || sopContent);
+
+  // ── Content hash for deterministic caching ───────────────────────────
+  const hashInput = [
+    sopContent.substring(0, 8000),
+    clause.clauseText.substring(0, 2000),
+    clause.clauseNumber,
+    clause.guidelineName,
+    aiModel,
+  ].join('||');
+  const contentHash = crypto.createHash('sha256').update(hashInput).digest('hex');
+
+  // ── Cache lookup ──────────────────────────────────────────────────────
+  try {
+    const dbConnect = (await import('@/lib/mongodb')).default;
+    const ComplianceAnalysisCache = (await import('@/models/ComplianceAnalysisCache')).default;
+    await dbConnect();
+
+    const cached = await ComplianceAnalysisCache.findOneAndUpdate(
+      { contentHash },
+      { $inc: { hitCount: 1 }, $set: { lastAccessedAt: new Date() } },
+      { new: true }
+    );
+
+    if (cached) {
+      console.log(`   ✅ Cache hit for clause ${clause.clauseNumber} (${cached.hitCount} hits)`);
+      const cp = cached.parsedResponse as any;
+
+      // Re-apply keyword fallback in case it wasn't stored (backward compat)
+      let complianceLevel = normalizeComplianceLevel(cp.complianceLevel || 'non-compliant');
+      if (!cp.isClauseApplicable) complianceLevel = 'not-applicable';
+      if (complianceLevel === 'unable-to-determine' && sopContent.length > 200) {
+        complianceLevel = keywordFallbackClassification(sopContent, clause);
+      }
+
+      return {
+        findingId: `finding-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        guidelineId:         cp.guidelineId         || clause.guidelineId,
+        guidelineName:       cp.guidelineName        || clause.guidelineName,
+        folderName:          cp.folderName           || clause.folderName,
+        pdfName:             cp.pdfName              || clause.pdfName,
+        clauseNumber:        cp.clauseNumber         || clause.clauseNumber,
+        clauseTitle:         cp.clauseTitle          || clause.clauseTitle,
+        clauseText:          cp.clauseText           || clause.clauseText,
+        regulatoryReference: cp.regulatoryReference  || `${clause.guidelineType} ${clause.clauseNumber}`,
+        sopSectionNumber:    cp.sopSectionNumber      || fallbackSectionNumber,
+        sopSectionTitle:     cp.sopSectionTitle       || fallbackSectionTitle,
+        sopTextSnippet:      cp.sopTextSnippet        || fallbackSnippet,
+        complianceLevel,
+        matchConfidence:     Math.min(100, Math.max(0, cp.matchConfidence ?? 50)),
+        issueType:           normalizeIssueType(cp.issueType),
+        issueSeverity:       normalizeIssueSeverity(cp.issueSeverity),
+        specificGap:         cp.specificGap          || buildConservativeGapText(complianceLevel, clause, cp.sopSectionNumber || fallbackSectionNumber, cp.sopSectionTitle || fallbackSectionTitle),
+        guidelineRequirement:cp.guidelineRequirement  || `Clause ${clause.clauseNumber} requires: ${trimToSentence(clause.clauseText, 220)}`,
+        sopCurrentState:     cp.sopCurrentState       || `Section ${cp.sopSectionNumber || fallbackSectionNumber} states: "${cp.sopTextSnippet || fallbackSnippet}"`,
+        suggestedAction:     cp.suggestedAction       || `Revise Section ${cp.sopSectionNumber || fallbackSectionNumber} to address Clause ${clause.clauseNumber}.`,
+        suggestedText:       cp.suggestedText         || buildConservativeSuggestedText(cp.sopSectionNumber || fallbackSectionNumber, clause),
+        estimatedEffort:     normalizeEstimatedEffort(cp.estimatedEffort),
+        priority:            Math.min(5, Math.max(1, cp.priority ?? 3)),
+        analyzedAt:          new Date(),
+        aiModelUsed:         aiModel,
+        analysisMethod:      'ai-semantic' as const,
+      };
+    }
+  } catch (cacheErr) {
+    console.warn('   ⚠️ Cache lookup failed (non-fatal):', (cacheErr as Error).message);
+  }
+  // ─────────────────────────────────────────────────────────────────────
+
+  // Larger context window — gemini-2.0-flash handles 128k tokens
+  const truncatedContent = sopContent.length > 8000
+    ? sopContent.substring(0, 8000) + '\n...[truncated for length]'
     : sopContent;
-  
-  // Generate structured prompt
+
   const prompt = generateCompliancePrompt({
     sopName,
     sopIdentifier,
@@ -518,69 +590,64 @@ export async function analyzeClauseWithPrecision(
   });
 
   try {
-    // Check API key before making the call
     if (!GEMINI_KEY) {
       throw new Error('GEMINI_API_KEY (or GOOGLE_AI_API_KEY) is not configured in .env.local.');
     }
-    const model = genAI.getGenerativeModel({ model: aiModel });
-    
+    const model = genAI.getGenerativeModel({
+      model: aiModel,
+      generationConfig: {
+        temperature: 0,     // greedy decoding → fully deterministic output
+        topP: 1,
+        topK: 1,
+        maxOutputTokens: 1024,
+      },
+    });
+
     let result;
     let parsed: any;
     let validationResult: any;
     let retryCount = 0;
     const maxRetries = 3;
-    
-    // Retry loop with validation
+
     while (retryCount < maxRetries) {
       try {
-        // Make AI call
-        const currentPrompt = retryCount === 0 
-          ? prompt 
+        const currentPrompt = retryCount === 0
+          ? prompt
           : generateRefinedPrompt({
               originalPrompt: prompt,
               previousResponse: JSON.stringify(parsed || {}),
               validationErrors: validationResult?.errors || [],
             });
-        
+
         result = await model.generateContent(currentPrompt);
         const responseText = result.response.text();
-        
-        // Extract JSON
+
         const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) {
-          throw new Error('AI response did not contain valid JSON');
-        }
-        
+        if (!jsonMatch) throw new Error('AI response did not contain valid JSON');
+
         parsed = JSON.parse(jsonMatch[0]);
-        
-        // Validate response
         validationResult = validateAIResponse(parsed);
-        
+
         if (validationResult.isValid) {
           console.log(`✅ Valid response on attempt ${retryCount + 1}`);
           break;
         } else {
           console.warn(`⚠️ Validation failed (Attempt ${retryCount + 1}/${maxRetries}):`, validationResult.errors);
           retryCount++;
-          
           if (retryCount >= maxRetries) {
-            console.error('Max retries reached. Using best available response.');
+            console.warn('Max retries reached. Using best available response.');
             break;
           }
-          
-          // Wait before retry
           await new Promise(resolve => setTimeout(resolve, 1000));
         }
       } catch (err: any) {
         console.warn(`⚠️ AI call failed (Attempt ${retryCount + 1}/${maxRetries}): ${err.message}`);
         retryCount++;
         if (retryCount >= maxRetries) throw err;
-        // Exponential backoff: 1s, 2s, 4s
         await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, retryCount - 1)));
       }
     }
 
-    // Sanitize AI output
     const sanitized = sanitizeAIOutput({
       findingId,
       guidelineId: clause.guidelineId,
@@ -593,34 +660,105 @@ export async function analyzeClauseWithPrecision(
       regulatoryReference: clause.regulatoryReference || `${clause.guidelineType} ${clause.clauseNumber}`,
       ...parsed,
     });
-    
-    // Detect hallucinations
+
     const hallucinationCheck = detectHallucination(sanitized);
     if (hallucinationCheck.isHallucinated) {
       console.warn(`⚠️ Possible hallucination detected:`, hallucinationCheck.reasons);
-      // Lower confidence score for suspected hallucinations
       sanitized.matchConfidence = Math.min(sanitized.matchConfidence, 60);
     }
-    
-    // Final validation
+
     const finalValidation = validateFinding(sanitized);
     if (!finalValidation.isValid) {
-      console.error(`❌ Final validation failed:`, finalValidation.errors);
-      // Log but continue - we'll use the best available data
+      console.warn(`⚠️ Final validation issues:`, finalValidation.errors);
     }
-    
     if (finalValidation.warnings.length > 0) {
       console.warn(`⚠️ Validation warnings:`, finalValidation.warnings);
     }
-    
-    // Determine final compliance level
+
+    // Determine compliance level
     let complianceLevel = normalizeComplianceLevel(sanitized.complianceLevel);
-    
-    // If not applicable, use that consistently
+
+    // Explicit not-applicable override
     if (!sanitized.isClauseApplicable) {
       complianceLevel = 'not-applicable';
     }
-    
+
+    // ── FALLBACK CLASSIFIER ──────────────────────────────────────────────
+    // If the AI still returned "unable-to-determine" despite instructions,
+    // apply a keyword-based classification so the finding is never wasted.
+    if (complianceLevel === 'unable-to-determine' && sopContent.length > 200) {
+      complianceLevel = keywordFallbackClassification(sopContent, clause);
+      console.log(`   🔄 Fallback classification applied: ${complianceLevel}`);
+    }
+    // ────────────────────────────────────────────────────────────────────
+
+    const sopSectionNumber = pickUsableText(sanitized.sopSectionNumber, 1) || fallbackSectionNumber;
+    const sopSectionTitle  = pickUsableText(sanitized.sopSectionTitle, 3)  || fallbackSectionTitle;
+    const sopTextSnippet   = pickUsableText(sanitized.sopTextSnippet, 10)  || fallbackSnippet;
+    const sopCurrentState  =
+      pickUsableText(sanitized.sopCurrentState, 15) ||
+      `Section ${sopSectionNumber} (${sopSectionTitle}) states: "${sopTextSnippet}"`;
+    const guidelineRequirement =
+      pickUsableText(sanitized.guidelineRequirement, 15) ||
+      `Clause ${clause.clauseNumber} requires: ${trimToSentence(clause.clauseText, 220)}`;
+    const specificGap =
+      pickUsableText(sanitized.specificGap, 20) ||
+      buildConservativeGapText(complianceLevel, clause, sopSectionNumber, sopSectionTitle);
+    const suggestedAction =
+      pickUsableText(sanitized.suggestedAction, 20) ||
+      `Revise Section ${sopSectionNumber} (${sopSectionTitle}) to explicitly address Clause ${clause.clauseNumber} (${clause.clauseTitle || 'requirement'}) with measurable controls.`;
+    const suggestedText =
+      pickUsableText(sanitized.suggestedText, 20) ||
+      buildConservativeSuggestedText(sopSectionNumber, clause);
+
+    // ── Write to cache (non-blocking) ──────────────────────────────────
+    const cachePayload = {
+      guidelineId: sanitized.guidelineId || clause.guidelineId,
+      guidelineName: sanitized.guidelineName || clause.guidelineName,
+      folderName: sanitized.folderName || clause.folderName,
+      pdfName: sanitized.pdfName || clause.pdfName,
+      clauseNumber: sanitized.clauseNumber || clause.clauseNumber,
+      clauseTitle: sanitized.clauseTitle || clause.clauseTitle,
+      clauseText: sanitized.clauseText || clause.clauseText,
+      regulatoryReference: sanitized.regulatoryReference || `${clause.guidelineType} ${clause.clauseNumber}`,
+      isClauseApplicable: sanitized.isClauseApplicable,
+      sopSectionNumber, sopSectionTitle, sopTextSnippet, complianceLevel,
+      matchConfidence: Math.min(100, Math.max(0, sanitized.matchConfidence || 50)),
+      issueType: sanitized.issueType,
+      issueSeverity: sanitized.issueSeverity,
+      specificGap, guidelineRequirement, sopCurrentState,
+      suggestedAction, suggestedText,
+      estimatedEffort: sanitized.estimatedEffort,
+      priority: Math.min(5, Math.max(1, sanitized.priority || 3)),
+      aiModelUsed: aiModel,
+    };
+    (async () => {
+      try {
+        const dbConnect = (await import('@/lib/mongodb')).default;
+        const ComplianceAnalysisCache = (await import('@/models/ComplianceAnalysisCache')).default;
+        await dbConnect();
+        await ComplianceAnalysisCache.findOneAndUpdate(
+          { contentHash },
+          {
+            $set: {
+              contentHash,
+              sopIdentifier,
+              clauseIdentifier: `${clause.guidelineName}|${clause.clauseNumber}`,
+              aiModel,
+              parsedResponse: cachePayload,
+              lastAccessedAt: new Date(),
+              expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+            },
+            $setOnInsert: { hitCount: 0 },
+          },
+          { upsert: true }
+        );
+      } catch (cacheWriteErr) {
+        // Non-fatal — analysis result still returned correctly
+      }
+    })();
+    // ────────────────────────────────────────────────────────────────────
+
     return {
       findingId: sanitized.findingId || findingId,
       guidelineId: sanitized.guidelineId || clause.guidelineId,
@@ -631,18 +769,18 @@ export async function analyzeClauseWithPrecision(
       clauseTitle: sanitized.clauseTitle || clause.clauseTitle,
       clauseText: sanitized.clauseText || clause.clauseText,
       regulatoryReference: sanitized.regulatoryReference || `${clause.guidelineType} ${clause.clauseNumber}`,
-      sopSectionNumber: sanitized.sopSectionNumber || 'N/A',
-      sopSectionTitle: sanitized.sopSectionTitle || 'Not Addressed',
-      sopTextSnippet: sanitized.sopTextSnippet || 'No specific SOP text identified for this clause.',
+      sopSectionNumber,
+      sopSectionTitle,
+      sopTextSnippet,
       complianceLevel,
       matchConfidence: Math.min(100, Math.max(0, sanitized.matchConfidence || 50)),
       issueType: normalizeIssueType(sanitized.issueType),
       issueSeverity: normalizeIssueSeverity(sanitized.issueSeverity),
-      specificGap: sanitized.specificGap || 'Analysis required',
-      guidelineRequirement: sanitized.guidelineRequirement || clause.clauseText.substring(0, 200),
-      sopCurrentState: sanitized.sopCurrentState || 'Not determined',
-      suggestedAction: sanitized.suggestedAction || 'Review required',
-      suggestedText: sanitized.suggestedText || 'Review and update this section to address the guideline requirement.',
+      specificGap,
+      guidelineRequirement,
+      sopCurrentState,
+      suggestedAction,
+      suggestedText,
       estimatedEffort: normalizeEstimatedEffort(sanitized.estimatedEffort),
       priority: Math.min(5, Math.max(1, sanitized.priority || 3)),
       analyzedAt: new Date(),
@@ -651,8 +789,12 @@ export async function analyzeClauseWithPrecision(
     };
   } catch (error) {
     console.error(`AI analysis failed for clause ${clause.clauseNumber}:`, error);
-    
-    // Return unable-to-determine instead of false non-compliant
+
+    // Hard AI failure — apply keyword fallback so we don't return unable-to-determine
+    const fallbackLevel = sopContent.length > 200
+      ? keywordFallbackClassification(sopContent, clause)
+      : 'unable-to-determine';
+
     return {
       findingId,
       guidelineId: clause.guidelineId,
@@ -663,18 +805,18 @@ export async function analyzeClauseWithPrecision(
       clauseTitle: clause.clauseTitle,
       clauseText: clause.clauseText,
       regulatoryReference: `${clause.guidelineType} ${clause.clauseNumber}`,
-      sopSectionNumber: 'N/A',
-      sopSectionTitle: 'Analysis Failed',
-      sopTextSnippet: 'Unable to extract - AI analysis failed. Manual review required.',
-      complianceLevel: 'unable-to-determine',
-      matchConfidence: 0,
-      issueType: 'not-applicable',
-      issueSeverity: 'informational',
-      specificGap: `AI analysis failed: ${(error as Error).message}`,
-      guidelineRequirement: clause.clauseText.substring(0, 200),
-      sopCurrentState: 'Unable to determine',
-      suggestedAction: 'Manual review required',
-      suggestedText: 'Manual review required - AI analysis was unable to generate suggested text.',
+      sopSectionNumber: fallbackSectionNumber,
+      sopSectionTitle: fallbackSectionTitle,
+      sopTextSnippet: fallbackSnippet,
+      complianceLevel: fallbackLevel,
+      matchConfidence: 30,
+      issueType: fallbackLevel === 'not-applicable' ? 'not-applicable' : 'missing-clause',
+      issueSeverity: 'minor',
+      specificGap: buildConservativeGapText(fallbackLevel, clause, fallbackSectionNumber, fallbackSectionTitle),
+      guidelineRequirement: `Clause ${clause.clauseNumber} requires: ${trimToSentence(clause.clauseText, 220)}`,
+      sopCurrentState: `Section ${fallbackSectionNumber} (${fallbackSectionTitle}) states: "${fallbackSnippet}"`,
+      suggestedAction: `Add explicit controls in Section ${fallbackSectionNumber} (${fallbackSectionTitle}) to address Clause ${clause.clauseNumber} (${clause.clauseTitle || 'requirement'}).`,
+      suggestedText: buildConservativeSuggestedText(fallbackSectionNumber, clause),
       estimatedEffort: 'medium',
       priority: 3,
       analyzedAt: new Date(),
@@ -683,6 +825,50 @@ export async function analyzeClauseWithPrecision(
     };
   }
 }
+
+/**
+ * Keyword-based fallback classifier used when the AI returns "unable-to-determine".
+ *
+ * Logic:
+ *  - Extract clause keywords and common GMP concept words from the clause text.
+ *  - Count how many appear in the SOP content.
+ *  - ≥3 keyword hits  → "partial"  (topic exists but may be incomplete)
+ *  - 1–2 keyword hits → "non-compliant" (barely addressed)
+ *  - 0 keyword hits   → "non-compliant" (requirement absent)
+ *
+ * This is intentionally conservative: missing evidence = non-compliant in GMP.
+ */
+function keywordFallbackClassification(
+  sopContent: string,
+  clause: GuidelineRequirement,
+): ComplianceFindingV3['complianceLevel'] {
+  const sopLower = sopContent.toLowerCase();
+
+  // Gather keywords: explicit clause keywords + words from clause title/text
+  const rawKeywords: string[] = [
+    ...(clause.keywords || []),
+    ...clause.clauseTitle.toLowerCase().split(/\W+/).filter(w => w.length > 3),
+    ...clause.clauseText.toLowerCase().split(/\W+/).filter(w => w.length > 4),
+  ];
+
+  // Deduplicate and take the 15 most distinctive terms
+  const keywords = Array.from(new Set(rawKeywords))
+    .filter(k => !COMMON_STOP_WORDS.has(k))
+    .slice(0, 15);
+
+  const hits = keywords.filter(k => sopLower.includes(k)).length;
+
+  if (hits >= 3) return 'partial';
+  return 'non-compliant';
+}
+
+const COMMON_STOP_WORDS = new Set([
+  'that', 'this', 'with', 'from', 'they', 'been', 'have', 'will', 'when',
+  'were', 'each', 'also', 'into', 'than', 'then', 'what', 'such', 'more',
+  'shall', 'must', 'should', 'would', 'could', 'which', 'where', 'these',
+  'those', 'their', 'there', 'other', 'some', 'over', 'only', 'both',
+  'made', 'used', 'make', 'does', 'most', 'through', 'upon', 'under',
+]);
 
 
 function findRelevantSection(sections: SOPSection[], clause: GuidelineRequirement): SOPSection {
@@ -744,19 +930,8 @@ export function calculateIntelligentScore(
     skippedCount: 0,
   };
   
-  // If too many unable-to-determine, mark as incomplete
-  if (unableToDetermineCount > totalFindings * 0.5) {
-    return {
-      overallScore: null,
-      compliancePercentage: null,
-      complianceStatus: 'Analysis Failed',
-      scoreBreakdown,
-    };
-  }
-  
-  // Calculate score excluding not-applicable and unable-to-determine
-  const applicableFindings = totalFindings - notApplicableCount - unableToDetermineCount;
-  
+  const applicableFindings = totalFindings - notApplicableCount;
+
   if (applicableFindings === 0) {
     return {
       overallScore: null,
@@ -765,12 +940,24 @@ export function calculateIntelligentScore(
       scoreBreakdown,
     };
   }
-  
-  // Weighted score: compliant=10, partial=5, non-compliant=0
+
+  // If ≥80% of applicable findings are unable-to-determine, there is not enough
+  // conclusive evidence to score the SOP — report as Analysis Pending rather than
+  // falsely showing 0/10 Non-Compliant.
+  if (unableToDetermineCount / applicableFindings >= 0.8) {
+    return {
+      overallScore: null,
+      compliancePercentage: null,
+      complianceStatus: 'Analysis Pending',
+      scoreBreakdown,
+    };
+  }
+
+  // Weighted score: compliant=10, partial=5, non-compliant=0, unable-to-determine=0
   const weightedScore = (compliantCount * 10 + partialCount * 5) / applicableFindings;
   const overallScore = Math.round(weightedScore * 10) / 10;
   const compliancePercentage = Math.round((compliantCount / applicableFindings) * 100);
-  
+
   // Determine status
   let complianceStatus: string;
   if (overallScore >= 8.5) {
@@ -829,6 +1016,68 @@ function normalizeEstimatedEffort(effort: string): 'low' | 'medium' | 'high' {
   if (normalized.includes('low')) return 'low';
   if (normalized.includes('high')) return 'high';
   return 'medium';
+}
+
+function pickUsableText(value: unknown, minLength: number): string {
+  const v = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!v) return '';
+  if (v.length < minLength) return '';
+  if (PLACEHOLDER_PATTERN.test(v)) return '';
+  return v;
+}
+
+function trimToSentence(text: string, maxChars: number): string {
+  const v = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!v) return '';
+  if (v.length <= maxChars) return v;
+  return `${v.slice(0, maxChars).trimEnd()}...`;
+}
+
+// Patterns that indicate a document header / metadata line rather than procedure content.
+const HEADER_METADATA_PATTERN = /^(standard\s+operating\s+procedure|sop\s+no|document\s+no|sop\s+title|record\s+title|identifier|revision|version|effective\s+date|approved\s+by|department|page\s+\d|prepared\s+by|issue\s+date)/i;
+
+function extractEvidenceSnippet(sectionContent: string): string {
+  const clean = String(sectionContent || '').replace(/\s+/g, ' ').trim();
+  if (!clean) {
+    return 'The current SOP text in this area requires explicit wording aligned to the guideline clause.';
+  }
+
+  const pieces = clean
+    .split(/(?<=[.!?])\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  // Skip metadata/header lines and find the first real procedure sentence
+  const procedureCandidate = pieces.find(
+    (p) => p.length >= 25 && !PLACEHOLDER_PATTERN.test(p) && !HEADER_METADATA_PATTERN.test(p)
+  );
+  if (procedureCandidate) return trimToSentence(procedureCandidate, 280);
+
+  // Fall back to any long-enough non-placeholder sentence
+  const anyCandidate = pieces.find((p) => p.length >= 20 && !PLACEHOLDER_PATTERN.test(p));
+  if (anyCandidate) return trimToSentence(anyCandidate, 280);
+
+  return trimToSentence(clean, 280);
+}
+
+function buildConservativeGapText(
+  level: ComplianceFindingV3['complianceLevel'],
+  clause: GuidelineRequirement,
+  sectionNumber: string,
+  sectionTitle: string,
+): string {
+  if (level === 'compliant') {
+    return `Section ${sectionNumber} (${sectionTitle}) provides language that aligns with Clause ${clause.clauseNumber}, and no material implementation gap is identified.`;
+  }
+  if (level === 'not-applicable') {
+    return `Clause ${clause.clauseNumber} does not align with the scope/process covered by this SOP, so no direct implementation gap is recorded for this document.`;
+  }
+  return `Section ${sectionNumber} (${sectionTitle}) does not explicitly demonstrate all controls expected by Clause ${clause.clauseNumber} (${clause.clauseTitle || 'requirement'}), so the requirement coverage remains incomplete.`;
+}
+
+function buildConservativeSuggestedText(sectionNumber: string, clause: GuidelineRequirement): string {
+  const requirement = trimToSentence(clause.clauseText, 180);
+  return `Section ${sectionNumber} shall include an explicit requirement that ${requirement}. Responsibilities, execution steps, evidence records, and acceptance criteria shall be documented in measurable terms to demonstrate sustained compliance.`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

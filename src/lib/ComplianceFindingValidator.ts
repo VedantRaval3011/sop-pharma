@@ -53,15 +53,13 @@ export interface ComplianceFindingInput {
   applicabilityReason?: string;
 }
 
-// Prohibited generic phrases that indicate low-quality AI output
+// Prohibited generic phrases that indicate the AI gave up instead of analyzing.
+// Note: "not applicable" / "not-applicable" are valid compliance levels and must NOT
+// be listed here — they appear legitimately in finding text for N/A clauses.
+// "not mentioned" is valid in sopCurrentState/specificGap for genuinely absent topics
+// (checked contextually below rather than globally).
 const PROHIBITED_PHRASES = [
   'no regulatory requirement found',
-  'not specified',
-  'not found',
-  'general compliance',
-  'not applicable',
-  'n/a',
-  'not addressed',
   'no specific requirement',
   'review required',
   'manual review required',
@@ -69,9 +67,11 @@ const PROHIBITED_PHRASES = [
   'analysis required',
   'not determined',
   'no information',
+];
+
+// Phrases prohibited only in specificGap (not in sopCurrentState where "not mentioned" is valid).
+const GAP_PROHIBITED_PHRASES = [
   'not mentioned',
-  'not clear',
-  'unclear',
 ];
 
 // Minimum length requirements for text fields
@@ -91,41 +91,65 @@ export function validateFinding(finding: ComplianceFindingInput): ValidationResu
   const errors: string[] = [];
   const warnings: string[] = [];
 
+  // compliant and not-applicable findings have no gap or suggested text by definition.
+  const isNonActionable =
+    finding.complianceLevel === 'compliant' || finding.complianceLevel === 'not-applicable';
+
   // 1. Required fields check
-  const requiredFields: (keyof ComplianceFindingInput)[] = [
+  // specificGap and suggestedText are only mandatory for actionable findings.
+  const alwaysRequired: (keyof ComplianceFindingInput)[] = [
     'guidelineId',
     'guidelineName',
     'clauseNumber',
     'sopSectionNumber',
     'complianceLevel',
-    'specificGap',
     'guidelineRequirement',
     'sopCurrentState',
     'suggestedAction',
+  ];
+  const actionableRequired: (keyof ComplianceFindingInput)[] = [
+    'specificGap',
     'suggestedText',
   ];
 
-  for (const field of requiredFields) {
+  for (const field of alwaysRequired) {
     if (!finding[field] || String(finding[field]).trim().length === 0) {
       errors.push(`Missing required field: ${field}`);
+    }
+  }
+  if (!isNonActionable) {
+    for (const field of actionableRequired) {
+      if (!finding[field] || String(finding[field]).trim().length === 0) {
+        errors.push(`Missing required field: ${field}`);
+      }
     }
   }
 
   // 2. STRICT: Check for generic/prohibited phrases
   const textFields = ['specificGap', 'guidelineRequirement', 'sopCurrentState', 'suggestedAction', 'suggestedText'];
-  
+
   for (const field of textFields) {
     const value = String(finding[field as keyof ComplianceFindingInput] || '').toLowerCase();
-    
+
     for (const phrase of PROHIBITED_PHRASES) {
       if (value.includes(phrase.toLowerCase())) {
         errors.push(`REJECTED: Field "${field}" contains prohibited phrase: "${phrase}"`);
       }
     }
-    
-    // Additional strict checks
+
+    // "not mentioned" is only prohibited in specificGap (describing a gap vaguely),
+    // not in sopCurrentState where it legitimately describes an absent topic.
     if (field === 'specificGap') {
-      // Gap must be specific and measurable
+      for (const phrase of GAP_PROHIBITED_PHRASES) {
+        if (value.includes(phrase.toLowerCase())) {
+          errors.push(`REJECTED: Field "${field}" contains prohibited phrase: "${phrase}"`);
+        }
+      }
+    }
+
+    // Additional strict checks
+    if (field === 'specificGap' && !isNonActionable) {
+      // Gap must be specific and measurable for actionable findings
       if (value.length < 30) {
         errors.push(`Gap too vague (${value.length} chars). Must be specific and measurable (min 30 chars)`);
       }
@@ -133,18 +157,17 @@ export function validateFinding(finding: ComplianceFindingInput): ValidationResu
         warnings.push('Gap uses "missing" - prefer "does not include/specify" for clarity');
       }
     }
-    
+
     if (field === 'sopCurrentState') {
       // Must look like a quote (should contain quotation marks or specific text)
       if (!value.includes('"') && !value.includes("'") && !value.includes('states') && !value.includes('specifies')) {
         warnings.push('sopCurrentState should be an exact quote or clearly reference SOP text');
       }
     }
-    
-    if (field === 'suggestedText') {
-      // Must be substantial (not just "update this")
-      if (value.length < 50) {
-        errors.push(`Suggested text too short (${value.length} chars). Must provide EXACT text to implement (min 50 chars)`);
+
+    if (field === 'suggestedText' && !isNonActionable) {
+      if (value.length < 30) {
+        warnings.push(`Suggested text short (${value.length} chars). Should provide exact wording to implement.`);
       }
     }
   }

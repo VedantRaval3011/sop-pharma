@@ -237,8 +237,9 @@ export function validateMultipleReports(reports: ComplianceReportData[]): {
 function getExpectedStatus(score: number): string {
   if (score >= 8.5) return 'Fully Compliant';
   if (score >= 5.0) return 'Partially Compliant';
-  if (score > 0) return 'Non-Compliant';
-  return 'Analysis Pending';
+  // When score is calculated (including 0), status should still be a compliance
+  // outcome, not "Analysis Pending". Pending is only for "no applicable findings".
+  return 'Non-Compliant';
 }
 
 /**

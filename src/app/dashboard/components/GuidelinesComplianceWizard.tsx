@@ -1,8 +1,19 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { X, ChevronRight, ChevronLeft, Loader2, BookOpen, AlertCircle, Eye, ChevronDown, ChevronUp, Minus, CheckCircle2, Clock, Terminal } from 'lucide-react';
+import { X, ChevronRight, ChevronLeft, Loader2, BookOpen, AlertCircle, Eye, ChevronDown, ChevronUp, Minus, CheckCircle2, Clock, Terminal, BarChart2 } from 'lucide-react';
 import { buildRealSopPickerOptions, type RegistrySopOption } from '@/lib/registrySopPickerOptions';
+import GuidelineComplianceDetailModal from './GuidelineComplianceDetailModal';
+
+interface GuidelineStat {
+  folderName: string;
+  totalFindings: number;
+  compliantCount: number;
+  partialCount: number;
+  nonCompliantCount: number;
+  notApplicableCount: number;
+  sopCount: number;
+}
 
 type GuidelineSummary = {
   _id: string;
@@ -150,6 +161,10 @@ export default function GuidelinesComplianceWizard({
     clausesAnalyzed: number;
   } | null>(null);
 
+  // ── Guideline compliance stats (for showing digits next to each guideline) ─
+  const [guidelineStats, setGuidelineStats] = useState<Record<string, GuidelineStat>>({});
+  const [detailGuidelineName, setDetailGuidelineName] = useState<string | null>(null);
+
   // ── Progress tracking ────────────────────────────────────────────────────
   const [analysisLogs, setAnalysisLogs] = useState<{ time: number; text: string; done?: boolean }[]>([]);
   const [analysisElapsed, setAnalysisElapsed] = useState(0);
@@ -255,6 +270,21 @@ export default function GuidelinesComplianceWizard({
     })();
     return () => { cancelled = true; };
   }, [open, prefetchedGuidelines]);
+
+  // Fetch guideline compliance stats when wizard opens
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    fetch('/api/compliance/guideline-stats')
+      .then(r => r.json())
+      .then(j => {
+        if (!cancelled && j.success && j.stats) {
+          setGuidelineStats(j.stats as Record<string, GuidelineStat>);
+        }
+      })
+      .catch(() => {/* ignore stats errors silently */});
+    return () => { cancelled = true; };
+  }, [open]);
 
   // Auto-select preset SOP
   useEffect(() => {
@@ -400,6 +430,7 @@ export default function GuidelinesComplianceWizard({
   const nCount = reviewFindings.filter((f) => f.complianceLevel === 'non-compliant').length;
 
   return (
+    <>
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-3">
       <div
         className="flex max-h-[min(92vh,900px)] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-indigo-200 bg-white shadow-2xl"
@@ -524,17 +555,47 @@ export default function GuidelinesComplianceWizard({
                       filteredGuidelines.map((g) => {
                         const id = String(g._id);
                         const checked = selectedIds.has(id);
+                        const gName = g.name || g.pdfName || 'Untitled';
+                        const stat = guidelineStats[gName];
+                        const hasStats = !!stat && stat.totalFindings > 0;
+                        const statColor = hasStats
+                          ? stat.nonCompliantCount > 0
+                            ? 'text-red-700 bg-red-50 border-red-200 hover:bg-red-100'
+                            : stat.partialCount > 0
+                            ? 'text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100'
+                            : 'text-emerald-700 bg-emerald-50 border-emerald-200 hover:bg-emerald-100'
+                          : 'text-gray-500 bg-gray-50 border-gray-200 hover:bg-gray-100';
                         return (
                           <li key={id}>
                             <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-white">
                               <input type="checkbox" checked={checked} onChange={() => toggleId(id)}
-                                className="mt-1 h-3.5 w-3.5 rounded border-gray-400 text-indigo-600 focus:ring-indigo-500" />
+                                className="mt-1 h-3.5 w-3.5 shrink-0 rounded border-gray-400 text-indigo-600 focus:ring-indigo-500" />
                               <span className="min-w-0 flex-1 text-xs leading-snug">
-                                <span className="font-semibold text-gray-900">{g.name || g.pdfName || 'Untitled'}</span>
+                                <span className="font-semibold text-gray-900">{gName}</span>
                                 <span className="block text-[10px] text-gray-500">
                                   {[g.folderName, g.guidelineType, g.category].filter(Boolean).join(' · ')}
                                 </span>
                               </span>
+                              {/* Compliance stats badge — shows digits, click opens detail popup */}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setDetailGuidelineName(gName);
+                                }}
+                                className={`shrink-0 flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[9px] font-bold transition-colors ${statColor}`}
+                                title={hasStats
+                                  ? `${stat.totalFindings} compliance points · ${stat.compliantCount} compliant · ${stat.nonCompliantCount} gaps · ${stat.sopCount} SOPs — click for details`
+                                  : 'No compliance analysis yet — click to check'}
+                              >
+                                <BarChart2 className="h-3 w-3 shrink-0" />
+                                {hasStats ? (
+                                  <span className="tabular-nums font-black">{stat.totalFindings}</span>
+                                ) : (
+                                  <span className="opacity-60">—</span>
+                                )}
+                              </button>
                               <button
                                 type="button"
                                 onClick={(e) => {
@@ -542,7 +603,7 @@ export default function GuidelinesComplianceWizard({
                                   e.stopPropagation();
                                   window.open(`/api/guidelines/upload?serve=${id}`, '_blank');
                                 }}
-                                className="ml-auto shrink-0 rounded px-1.5 py-0.5 text-indigo-600 hover:bg-indigo-50 hover:text-indigo-800"
+                                className="shrink-0 rounded px-1.5 py-0.5 text-indigo-600 hover:bg-indigo-50 hover:text-indigo-800"
                                 title="View PDF"
                               >
                                 <Eye className="h-3.5 w-3.5" />
@@ -794,5 +855,14 @@ export default function GuidelinesComplianceWizard({
         </div>
       </div>
     </div>
+
+    {/* Guideline compliance detail popup */}
+    {detailGuidelineName && (
+      <GuidelineComplianceDetailModal
+        guidelineName={detailGuidelineName}
+        onClose={() => setDetailGuidelineName(null)}
+      />
+    )}
+  </>
   );
 }

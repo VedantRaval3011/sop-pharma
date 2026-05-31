@@ -2,15 +2,8 @@
  * ═══════════════════════════════════════════════════════════════════════
  * Compliance Analysis Prompts
  * ═══════════════════════════════════════════════════════════════════════
- * 
- * PURPOSE:
- * Centralized, version-controlled AI prompts for compliance analysis.
- * Enforces strict JSON output with validation and prevents hallucinations.
  */
 
-/**
- * JSON Schema that AI must follow for compliance analysis
- */
 export const COMPLIANCE_OUTPUT_SCHEMA = {
   type: 'object',
   required: [
@@ -64,7 +57,8 @@ export const COMPLIANCE_OUTPUT_SCHEMA = {
 };
 
 /**
- * Prohibited phrases that indicate low-quality output
+ * Phrases that indicate the AI gave up rather than analyzing.
+ * Only applied to TEXT fields (not complianceLevel enum value).
  */
 export const PROHIBITED_OUTPUT_PHRASES = [
   'No regulatory requirement found',
@@ -84,9 +78,6 @@ export const PROHIBITED_OUTPUT_PHRASES = [
   'Not addressed',
 ];
 
-/**
- * Few-shot examples of correct output
- */
 export const COMPLIANCE_EXAMPLES = [
   {
     input: {
@@ -104,7 +95,7 @@ export const COMPLIANCE_EXAMPLES = [
       issueSeverity: 'major',
       specificGap: 'SOP mentions equipment maintenance but does not specify annual calibration requirement or 5-year record retention period.',
       guidelineRequirement: 'Equipment must be calibrated annually with records maintained for 5 years.',
-      sopCurrentState: 'SOP Section 4.2 states "Equipment shall be maintained according to manufacturer specifications" but does not mention calibration frequency or record retention.',
+      sopCurrentState: 'Section 4.2 states "Equipment shall be maintained according to manufacturer specifications" but does not mention calibration frequency or record retention.',
       sopTextSnippet: 'Equipment shall be maintained according to manufacturer specifications and documented in the equipment log.',
       suggestedAction: 'Add specific calibration frequency requirement and record retention period to Section 4.2.',
       suggestedText: 'All equipment shall be calibrated annually as per approved calibration procedures. Calibration records shall be maintained for a minimum of 5 years.',
@@ -128,10 +119,10 @@ export const COMPLIANCE_EXAMPLES = [
       issueSeverity: 'informational',
       specificGap: 'No gap identified. SOP adequately addresses risk assessment and QA approval requirements.',
       guidelineRequirement: 'Change control must include risk assessment and QA approval.',
-      sopCurrentState: 'SOP Section 7.1 states "All changes must undergo risk assessment and receive QA Head approval before implementation."',
+      sopCurrentState: 'Section 7.1 states "All changes must undergo risk assessment and receive QA Head approval before implementation."',
       sopTextSnippet: 'All proposed changes shall be evaluated for risk impact and submitted to QA Head for review and approval.',
       suggestedAction: 'No action required. Current SOP text is compliant.',
-      suggestedText: 'No changes needed. Maintain current procedure.',
+      suggestedText: 'No changes needed. Current procedure meets the guideline requirement.',
       estimatedEffort: 'low',
       priority: 5,
     },
@@ -139,7 +130,11 @@ export const COMPLIANCE_EXAMPLES = [
 ];
 
 /**
- * Generate the main compliance analysis prompt - STRICT REGULATORY AUDITOR MODE
+ * Generate the main compliance analysis prompt.
+ *
+ * KEY DESIGN PRINCIPLE: "unable-to-determine" is forbidden for SOPs with readable
+ * content. The AI must always make a definitive call:
+ *   compliant | partial | non-compliant | not-applicable
  */
 export function generateCompliancePrompt(params: {
   sopName: string;
@@ -156,118 +151,112 @@ export function generateCompliancePrompt(params: {
   clauseText: string;
   category: string;
 }): string {
-  return `🚨 YOU ARE A REGULATORY COMPLIANCE AUDITOR SYSTEM - NOT A TEXT GENERATOR
+  return `You are a pharmaceutical GMP regulatory compliance auditor performing a formal SOP audit.
+Your job is to compare a specific SOP section against one regulatory clause and produce a structured compliance finding.
 
-PRIMARY MISSION:
-- Analyze SOP vs Guideline
-- Identify EXACT gaps
-- Provide STRUCTURED, VERIFIABLE output ONLY
-- NO generic explanations, NO long paragraphs, NO assumptions
-
-🔒 HARD RULES (MANDATORY):
-❌ NO generic phrases: "not found", "not specified", "review required", "not clear"
-❌ NO storytelling or explanations
-❌ NO assumptions
-✅ ONLY structured data
-✅ Each finding MUST map: Guideline ↔ SOP ↔ Gap
-✅ Each suggestion MUST fix a specific gap with EXACT text
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📋 SOP UNDER AUDIT:
-ID: ${params.sopIdentifier}
-Name: ${params.sopName}
+════════════════════════════════════════════════════════════════
+SOP UNDER AUDIT
+════════════════════════════════════════════════════════════════
+SOP ID   : ${params.sopIdentifier}
+SOP Name : ${params.sopName}
 Department: ${params.department}
 
-📄 RELEVANT SOP SECTION:
-Section: ${params.relevantSectionNumber} - ${params.relevantSectionTitle}
-Content: ${params.relevantSectionContent.substring(0, 1500)}${params.relevantSectionContent.length > 1500 ? '...' : ''}
+MOST RELEVANT SOP SECTION (primary evidence):
+Section ${params.relevantSectionNumber} — ${params.relevantSectionTitle}
+---
+${params.relevantSectionContent.substring(0, 2000)}${params.relevantSectionContent.length > 2000 ? '\n...[truncated]' : ''}
+---
 
-📚 FULL SOP CONTEXT:
-${params.sopContent.substring(0, 3000)}${params.sopContent.length > 3000 ? '...' : ''}
+FULL SOP CONTENT (supporting context):
+---
+${params.sopContent.substring(0, 5000)}${params.sopContent.length > 5000 ? '\n...[truncated]' : ''}
+---
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📖 GUIDELINE REQUIREMENT TO VERIFY:
-Source: ${params.guidelineName} (${params.guidelineType})
-Clause: ${params.clauseNumber} - ${params.clauseTitle}
+════════════════════════════════════════════════════════════════
+REGULATORY CLAUSE TO VERIFY
+════════════════════════════════════════════════════════════════
+Source  : ${params.guidelineName} (${params.guidelineType})
+Clause  : ${params.clauseNumber} — ${params.clauseTitle}
 Category: ${params.category}
 
-ATOMIC REQUIREMENT:
-${params.clauseText.substring(0, 2000)}${params.clauseText.length > 2000 ? '...' : ''}
+Clause Text:
+---
+${params.clauseText.substring(0, 2000)}${params.clauseText.length > 2000 ? '...[truncated]' : ''}
+---
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+════════════════════════════════════════════════════════════════
+AUDIT INSTRUCTIONS
+════════════════════════════════════════════════════════════════
 
-⚙️ AUDIT PROCESS (STRICT):
+STEP 1 — APPLICABILITY CHECK
+Decide whether this regulatory clause is relevant to this SOP.
+• "not-applicable" = the clause governs a fundamentally different process
+  (e.g., drug labeling requirements for an equipment-cleaning SOP).
+• If the clause covers ANY principle that this SOP should follow
+  (documentation, safety, cleanliness, records, training, etc.),
+  it IS applicable — proceed to Step 2.
 
-STEP 1: Determine Applicability
-→ Does this requirement apply to this SOP's scope and department?
-→ If NO: mark "not-applicable" and explain why
-→ If YES: proceed to Step 2
+STEP 2 — LOCATE SOP EVIDENCE
+Find the best matching text in the SOP provided above.
+• Quote verbatim text or paraphrase closely if no exact quote exists.
+• If the topic is completely absent, note which section SHOULD contain it.
+• sopTextSnippet MUST be at least one sentence from the SOP content above.
 
-STEP 2: Locate SOP Evidence
-→ Find the EXACT section that addresses (or should address) this requirement
-→ Quote the EXACT text from the SOP (not paraphrased)
-→ If not found anywhere: note which section SHOULD contain it
+STEP 3 — SIDE-BY-SIDE COMPARISON
+State in one sentence what the GUIDELINE requires.
+State what the SOP CURRENTLY says (quote or close paraphrase).
+Identify the EXACT gap (what is present vs. what is required).
 
-STEP 3: Perform 1:1 Comparison
-→ What does the GUIDELINE require? (1 sentence, specific)
-→ What does the SOP CURRENTLY state? (exact quote)
-→ What is the EXACT gap? (specific, measurable)
+STEP 4 — COMPLIANCE DETERMINATION (MANDATORY — CHOOSE ONE)
+⚠️ "unable-to-determine" is ONLY allowed if the SOP content is completely
+   empty or unreadable. For all other cases you MUST choose:
 
-STEP 4: Determine Compliance Level
-→ Fully matched = "compliant"
-→ Partially present = "partial"
-→ Missing/incorrect = "non-compliant"
-→ Cannot determine = "unable-to-determine"
+   • "compliant"       — SOP fully addresses the clause principle
+   • "partial"         — SOP partially addresses it; some elements missing
+   • "non-compliant"   — SOP does not address the clause at all
+   • "not-applicable"  — Clause is completely out of scope for this SOP
 
-STEP 5: Generate Fix (if gap exists)
-→ Specific action to take
-→ EXACT text to add/modify
-→ Section where change should be made
+DECISION RULES:
+• If the clause principle is MISSING from the SOP → "non-compliant"
+• If the SOP has SOME related content but lacks specifics → "partial"
+• If clause addresses general GMP principles (documentation, records,
+  procedures, responsibilities) → it applies to ALL pharmaceutical SOPs
+• When uncertain between "non-compliant" and "partial" → choose "partial"
+  if ANY related wording exists in the SOP
+• Conservative assessment is preferred over "unable-to-determine"
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — REMEDIATION (if gap exists)
+Provide an exact action to fix the gap.
+Provide exact replacement/addition text (not "update this section").
 
-📦 REQUIRED OUTPUT FORMAT (NO DEVIATION):
+════════════════════════════════════════════════════════════════
+OUTPUT — VALID JSON ONLY (no markdown, no commentary)
+════════════════════════════════════════════════════════════════
 
 {
-  "isClauseApplicable": true or false,
-  "applicabilityReason": "Brief reason why this clause does/doesn't apply to this SOP",
-  "sopSectionNumber": "5.2" (exact section number, or "N/A" if not found),
-  "sopSectionTitle": "Equipment Maintenance" (exact title, or "Not Addressed"),
-  "complianceLevel": "compliant" | "partial" | "non-compliant" | "not-applicable" | "unable-to-determine",
-  "matchConfidence": 85 (0-100, how confident you are in this assessment),
-  "issueType": "missing-clause" | "partial-coverage" | "incorrect-implementation" | "outdated-practice" | "ambiguous-wording" | "no-issue" | "not-applicable",
-  "issueSeverity": "critical" | "major" | "minor" | "informational",
-  "specificGap": "SOP specifies fixed 3-month maintenance schedule but does not link to Quality Risk Management (QRM) principles",
-  "guidelineRequirement": "Maintenance frequency must be risk-based per ICH Q9",
-  "sopCurrentState": "Section 5.2 states: 'Equipment shall be maintained every 3 months as per fixed schedule'",
+  "isClauseApplicable": true,
+  "applicabilityReason": "Why this clause does or does not apply to this SOP (min 20 chars)",
+  "sopSectionNumber": "5.2",
+  "sopSectionTitle": "Equipment Maintenance",
+  "complianceLevel": "compliant | partial | non-compliant | not-applicable",
+  "matchConfidence": 75,
+  "issueType": "missing-clause | partial-coverage | incorrect-implementation | outdated-practice | ambiguous-wording | no-issue | not-applicable",
+  "issueSeverity": "critical | major | minor | informational",
+  "specificGap": "Exact measurable gap — what the guideline requires vs. what the SOP states",
+  "guidelineRequirement": "One-sentence statement of what this clause requires",
+  "sopCurrentState": "Section 5.2 states: 'Equipment shall be maintained every 3 months' — no frequency justification provided",
   "sopTextSnippet": "Equipment shall be maintained every 3 months as per fixed schedule",
-  "suggestedAction": "Update Section 5.2 to include QRM-based frequency justification",
-  "suggestedText": "Equipment maintenance frequency shall be determined based on Quality Risk Management (QRM) assessment considering equipment criticality, validated Design Space, and impact on Critical Process Parameters (CPPs). Maintenance intervals shall be justified and documented in the Equipment Maintenance Plan.",
-  "estimatedEffort": "low" | "medium" | "high",
-  "priority": 2 (1=highest, 5=lowest)
+  "suggestedAction": "Update Section 5.2 to include risk-based frequency justification aligned to Clause ${params.clauseNumber}",
+  "suggestedText": "Equipment maintenance frequency shall be determined based on risk assessment considering equipment criticality and process impact. Maintenance intervals shall be documented and justified.",
+  "estimatedEffort": "low | medium | high",
+  "priority": 3
 }
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🎯 QUALITY CHECKS (BEFORE SUBMITTING):
-
-✅ Is "specificGap" EXACT and measurable? (not "missing information")
-✅ Is "sopCurrentState" an EXACT quote? (not paraphrased)
-✅ Is "suggestedText" EXACT text to implement? (not "update this section")
-✅ Is "guidelineRequirement" a clear 1-sentence requirement? (not a paragraph)
-✅ Does output contain NO prohibited phrases?
-
-If ANY check fails → REJECT and REGENERATE
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-OUTPUT ONLY VALID JSON (NO MARKDOWN, NO EXPLANATIONS):`;
+OUTPUT ONLY VALID JSON:`;
 }
 
 /**
- * Generate a refined prompt for retry attempts
+ * Refined retry prompt — gives the AI explicit guidance to fix specific errors.
  */
 export function generateRefinedPrompt(params: {
   originalPrompt: string;
@@ -276,21 +265,30 @@ export function generateRefinedPrompt(params: {
 }): string {
   return `${params.originalPrompt}
 
-**PREVIOUS ATTEMPT FAILED VALIDATION:**
-Errors: ${params.validationErrors.join(', ')}
+════════════════════════════════════════════════════════════════
+RETRY — PREVIOUS RESPONSE FAILED VALIDATION
+════════════════════════════════════════════════════════════════
+Errors to fix: ${params.validationErrors.join(' | ')}
 
-**REQUIREMENTS FOR THIS RETRY:**
-1. Fix all validation errors listed above
-2. Be MORE SPECIFIC in your gap description
-3. Quote EXACT text from the SOP (not paraphrased)
-4. Provide CONCRETE suggested text (not "update this section")
-5. Ensure all required fields have minimum character lengths
+MANDATORY CORRECTIONS:
+1. Fix every error listed above before responding.
+2. sopTextSnippet MUST contain at least one sentence copied from the SOP text provided.
+3. sopCurrentState MUST describe what the SOP currently says (reference section + content).
+4. suggestedText MUST be concrete replacement wording — not "update this section".
+5. specificGap MUST name the exact missing element (not a generic description).
+6. complianceLevel MUST be one of: compliant / partial / non-compliant / not-applicable.
+   "unable-to-determine" is forbidden when SOP text has been provided above.
+7. Remove all placeholder phrases: "N/A", "Not determined", "Unable to determine",
+   "Not specified", "Review required".
+8. If the clause clearly does not apply to this SOP's scope → use "not-applicable".
+9. If the requirement is simply absent from the SOP → use "non-compliant".
 
-**YOUR CORRECTED ANALYSIS (JSON ONLY):**`;
+YOUR CORRECTED ANALYSIS (JSON ONLY):`;
 }
 
 /**
- * Validate AI response against schema and quality rules
+ * Validate the raw AI JSON response.
+ * Errors → trigger retry. Warnings → logged but not blocking.
  */
 export function validateAIResponse(response: any): {
   isValid: boolean;
@@ -300,7 +298,7 @@ export function validateAIResponse(response: any): {
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  // Check required fields
+  // Required fields
   const requiredFields = COMPLIANCE_OUTPUT_SCHEMA.required;
   for (const field of requiredFields) {
     if (!(field in response)) {
@@ -308,18 +306,16 @@ export function validateAIResponse(response: any): {
     }
   }
 
-  // Check for prohibited phrases
-  const textFields = [
+  // Prohibited phrases in text fields — ERRORS (cause retry)
+  const strictTextFields = [
     'specificGap',
-    'guidelineRequirement',
     'sopCurrentState',
     'suggestedAction',
     'suggestedText',
   ];
 
-  for (const field of textFields) {
+  for (const field of strictTextFields) {
     const value = (response[field] || '').toLowerCase();
-    
     for (const phrase of PROHIBITED_OUTPUT_PHRASES) {
       if (value.includes(phrase.toLowerCase())) {
         errors.push(`Prohibited phrase in ${field}: "${phrase}"`);
@@ -327,7 +323,15 @@ export function validateAIResponse(response: any): {
     }
   }
 
-  // Check minimum lengths
+  // sopTextSnippet — prohibited phrases are WARNINGS only (snippet may be short but honest)
+  const snippetValue = (response['sopTextSnippet'] || '').toLowerCase();
+  for (const phrase of PROHIBITED_OUTPUT_PHRASES) {
+    if (snippetValue.includes(phrase.toLowerCase())) {
+      warnings.push(`Placeholder phrase in sopTextSnippet: "${phrase}"`);
+    }
+  }
+
+  // Minimum lengths — ERRORS
   const minLengths: Record<string, number> = {
     applicabilityReason: 20,
     specificGap: 20,
@@ -335,7 +339,6 @@ export function validateAIResponse(response: any): {
     sopCurrentState: 15,
     suggestedAction: 20,
     suggestedText: 20,
-    sopTextSnippet: 10,
   };
 
   for (const [field, minLength] of Object.entries(minLengths)) {
@@ -345,28 +348,43 @@ export function validateAIResponse(response: any): {
     }
   }
 
-  // Check confidence score
-  if (response.matchConfidence < 0 || response.matchConfidence > 100) {
+  // sopTextSnippet length is a WARNING only (fallback will fill it in)
+  const snippetLen = (response['sopTextSnippet'] || '').length;
+  if (snippetLen < 10) {
+    warnings.push(`sopTextSnippet too short (${snippetLen} chars, min 10) — fallback will be used`);
+  }
+
+  // Confidence score
+  if (typeof response.matchConfidence === 'number' &&
+      (response.matchConfidence < 0 || response.matchConfidence > 100)) {
     errors.push(`Invalid confidence score: ${response.matchConfidence}`);
   }
 
-  // Check priority
-  if (response.priority < 1 || response.priority > 5) {
+  // Priority
+  if (typeof response.priority === 'number' &&
+      (response.priority < 1 || response.priority > 5)) {
     errors.push(`Invalid priority: ${response.priority}`);
   }
 
-  // Warnings for quality issues
-  if (response.matchConfidence < 50 && response.complianceLevel !== 'unable-to-determine') {
-    warnings.push('Low confidence score for non-uncertain finding');
+  // "unable-to-determine" — push to warning, not error (the engine handles fallback)
+  if (response.complianceLevel === 'unable-to-determine') {
+    warnings.push('complianceLevel is "unable-to-determine" — engine will apply fallback classification if SOP content exists');
   }
 
-  if (response.sopSectionNumber === 'N/A' && response.complianceLevel !== 'not-applicable') {
-    warnings.push('SOP section not identified for applicable finding');
+  // Soft quality warnings
+  if (response.sopCurrentState &&
+      !response.sopCurrentState.includes('"') &&
+      !response.sopCurrentState.includes("'") &&
+      !response.sopCurrentState.toLowerCase().includes('states') &&
+      !response.sopCurrentState.toLowerCase().includes('specif')) {
+    warnings.push('sopCurrentState should be an exact quote or clearly reference SOP text');
   }
 
-  return {
-    isValid: errors.length === 0,
-    errors,
-    warnings,
-  };
+  if (response.suggestedAction &&
+      !response.suggestedAction.toLowerCase().includes('section') &&
+      !response.suggestedAction.toLowerCase().includes('clause')) {
+    warnings.push('Suggestion does not reference specific SOP section');
+  }
+
+  return { isValid: errors.length === 0, errors, warnings };
 }
