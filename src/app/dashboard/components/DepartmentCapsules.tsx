@@ -1644,6 +1644,7 @@ function DepartmentCapsuleCard({
                   capsuleAvailMissMatches(deptForFilter, "brief", "available", filterSnapshot) ||
                   capsuleAvailMissMatches(deptForFilter, "brief", "missing", filterSnapshot)
                 }
+                titleSummary={`${sopsWithBrief ?? 0} SOPs with brief video · ${sopsWithoutBrief ?? 0} missing`}
               />
             )}
             <div className="h-0.5" />
@@ -1662,6 +1663,7 @@ function DepartmentCapsuleCard({
                   capsuleAvailMissMatches(deptForFilter, "explainer", "available", filterSnapshot) ||
                   capsuleAvailMissMatches(deptForFilter, "explainer", "missing", filterSnapshot)
                 }
+                titleSummary={`${sopsWithExplainer ?? 0} SOPs with explainer video · ${sopsWithoutExplainer ?? 0} missing`}
               />
             )}
           </>
