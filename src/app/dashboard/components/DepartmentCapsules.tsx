@@ -500,7 +500,7 @@ function CapsuleMetric({
   );
 }
 
-export type CapsuleAvailMetric = "docx" | "pdf" | "video" | "slides";
+export type CapsuleAvailMetric = "docx" | "pdf" | "video" | "slides" | "brief" | "explainer";
 
 /** Green = filled slots (DOCX/PDF); red = missing slots; click filters still use row-level “has any” / “has gap”. */
 function CapsuleMetricAvailMissing({
@@ -847,7 +847,9 @@ export type CapsuleFilterMode =
   | "docx"
   | "pdf"
   | "video"
-  | "slides";
+  | "slides"
+  | "brief"
+  | "explainer";
 
 export type CapsuleFilterSnapshot = {
   filterDept: string;
